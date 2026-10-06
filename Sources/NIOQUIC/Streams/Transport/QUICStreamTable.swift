@@ -66,10 +66,13 @@ final class QUICStreamTable<Consumer: QUICStreamConsumer & ~Copyable> {
     /// The role of the local peer.
     let role: Role
 
-    /// Context for the `SwiftNetwork` stack.
-    let context: NetworkContext
+    /// The connection's entry into its SwiftNetwork stack.
+    let stack: SwiftNetworkStackAccess
 
-    init(role: Role, context: NetworkContext) {
+    /// External stream linkages, keyed by handle, so the stack can deliver events to a slot.
+    var _externals: [QUICStreamHandle: QUICStreamProxy<Consumer>]
+
+    init(role: Role, stack: SwiftNetworkStackAccess) {
         self._transportStates = QUICStreamSlots()
         self._consumerStates = QUICStreamConsumerStates()
         self._ready = []
@@ -80,7 +83,8 @@ final class QUICStreamTable<Consumer: QUICStreamConsumer & ~Copyable> {
         self.inReadLoop = false
         self.outOfBandDrainRequested = false
         self.role = role
-        self.context = context
+        self.stack = stack
+        self._externals = [:]
     }
 
     deinit {
@@ -174,9 +178,14 @@ extension QUICStreamTable where Consumer: ~Copyable {
         return handle
     }
 
-    /// The reference the `SwiftNetwork` stack routes the given stream's events through.
-    func reference(for handle: QUICStreamHandle) -> ProtocolInstanceReference {
-        ProtocolInstanceReference(custom: self, index: handle.protocolInstanceReferenceIndex)
+    /// The external linkage the `SwiftNetwork` stack routes the given stream's events through.
+    func external(for handle: QUICStreamHandle) -> QUICStreamProxy<Consumer> {
+        if let existing = self._externals[handle] {
+            return existing
+        }
+        let proxy = QUICStreamProxy(table: self, handle: handle)
+        self._externals[handle] = proxy
+        return proxy
     }
 
     /// Records the ID the stack assigned, indexes it, and connects the stream's state machine.
@@ -479,6 +488,9 @@ extension QUICStreamTable where Consumer: ~Copyable {
 
         self._transportStates.removeValue(for: handle)
         self._consumerStates.removeValue(at: handle.index)
+        if let proxy = self._externals.removeValue(forKey: handle) {
+            self.stack.release(proxy)
+        }
     }
 
     /// Closes and vacates every remaining slot, without a visit.
@@ -487,6 +499,10 @@ extension QUICStreamTable where Consumer: ~Copyable {
             var transport = consume transport
             transport.core.close(error: error)
         }
+        for proxy in self._externals.values {
+            self.stack.release(proxy)
+        }
+        self._externals.removeAll()
         self._consumerStates.removeAll()
         self._ready.removeAll(keepingCapacity: true)
         self._needsState.removeAll(keepingCapacity: true)

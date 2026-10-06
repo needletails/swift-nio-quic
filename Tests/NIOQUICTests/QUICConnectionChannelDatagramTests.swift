@@ -319,8 +319,8 @@ extension QUICConnectionChannelDatagramTests {
     static func withLiveConnection(
         body: (SwiftNetworkQUICConnection<QUICStreamChannels>, DatagramTestTransport, DatagramRecorder) throws -> Void
     ) throws {
-        let privateKeyPath = Bundle.module.url(forResource: "privateKey", withExtension: "der")!.path
-        let publicKeyPath = Bundle.module.url(forResource: "publicKey", withExtension: "der")!.path
+        let privateKeyPath = testResourcePath("privateKey", withExtension: "der")
+        let publicKeyPath = testResourcePath("publicKey", withExtension: "der")
 
         var rng: any RandomNumberGenerator = SystemRandomNumberGenerator()
         let eventLoop = EmbeddedEventLoop()

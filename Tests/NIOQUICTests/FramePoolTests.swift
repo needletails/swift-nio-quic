@@ -47,6 +47,8 @@ struct FramePoolTests {
         expectNil(pool.takeFrame(minimumSize: 300))
     }
 
+    // Exit tests spawn a child process. Swift Testing does not provide them on Android.
+    #if !os(Android)
     @Test
     @available(anyAppleOS 26, *)
     func initPreconditions() async {
@@ -71,6 +73,7 @@ struct FramePoolTests {
             _ = FramePool(smallFrameSize: 10, maxSmallFrames: 1, largeFrameSize: 9, maxLargeFrames: 1)
         }
     }
+    #endif
 
     @Test(
         arguments: [

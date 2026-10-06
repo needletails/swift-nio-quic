@@ -16,12 +16,14 @@ import NIOCore
 import NIOQUICHelpers
 @_spi(Essentials) @_spi(ProtocolProvider) import SwiftNetwork
 
-#if canImport(Glibc)
+#if canImport(Android)
+import Android
+#elseif canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
 import Glibc
 #elseif canImport(Musl)
 import Musl
-#elseif canImport(Darwin)
-import Darwin
 #endif
 
 //                                      ┌──────────────┐

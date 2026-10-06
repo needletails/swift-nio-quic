@@ -147,8 +147,8 @@ func makeConsumerPair<Client: QUICStreamConsumer, Server: QUICStreamConsumer>(
     makeClientConsumer: @escaping @Sendable (_ connection: QUICStreamConnection<Client>) -> Client,
     makeServerConsumer: @escaping @Sendable (_ connection: QUICStreamConnection<Server>) -> Server
 ) async throws -> ConsumerPair<Client, Server> {
-    let publicKeyPath = Bundle.module.url(forResource: "publicKey", withExtension: "der")!.path
-    let privateKeyPath = Bundle.module.url(forResource: "privateKey", withExtension: "der")!.path
+    let publicKeyPath = testResourcePath("publicKey", withExtension: "der")
+    let privateKeyPath = testResourcePath("privateKey", withExtension: "der")
 
     let serverConfiguration = QUICConfiguration.server(
         serverName: "quic-test.local",

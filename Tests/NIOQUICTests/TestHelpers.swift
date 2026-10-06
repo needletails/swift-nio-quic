@@ -18,16 +18,13 @@ import Synchronization
 import XCTest
 
 extension XCTestCase {
-    static let goodTestCertificatePath: String = Bundle.module.url(forResource: "testcert", withExtension: "pem")!.path
+    static let goodTestCertificatePath: String = testResourcePath("testcert", withExtension: "pem")
 
-    static let goodTestCertificateKeyPath: String = Bundle.module.url(forResource: "testkey", withExtension: "pem")!
-        .path
+    static let goodTestCertificateKeyPath: String = testResourcePath("testkey", withExtension: "pem")
 
-    static let testPrivateKeyPath: String = Bundle.module.url(forResource: "privateKey", withExtension: "der")!
-        .path
+    static let testPrivateKeyPath: String = testResourcePath("privateKey", withExtension: "der")
 
-    static let testPublicKeyPath: String = Bundle.module.url(forResource: "publicKey", withExtension: "der")!
-        .path
+    static let testPublicKeyPath: String = testResourcePath("publicKey", withExtension: "der")
 }
 
 @available(macOS 15, iOS 18, tvOS 18, watchOS 11, visionOS 2, *)

@@ -50,8 +50,8 @@ func createServerChannel(
     let quicConfiguration = QUICConfiguration.server(
         serverName: "quic-test.local",
         authenticationConfiguration: .rawPublicKeys(
-            publicKeyFilePath: Bundle.module.url(forResource: "publicKey", withExtension: "der")!.path,
-            privateKeyFilePath: Bundle.module.url(forResource: "privateKey", withExtension: "der")!.path
+            publicKeyFilePath: testResourcePath("publicKey", withExtension: "der"),
+            privateKeyFilePath: testResourcePath("privateKey", withExtension: "der")
         ),
         applicationProtocols: ["http/0.9"],
         keyLogPath: "/tmp/quic-sync-integration-tests-keylogs",
@@ -86,7 +86,7 @@ func createClientChannel(
 ) -> EventLoopFuture<any Channel> {
     let quicConfiguration = QUICConfiguration.client(
         verificationConfiguration: .rawPublicKeys(
-            publicKeyFilePath: Bundle.module.url(forResource: "publicKey", withExtension: "der")!.path
+            publicKeyFilePath: testResourcePath("publicKey", withExtension: "der")
         ),
         applicationProtocols: ["http/0.9"],
         maxDatagramFrameSize: maxDatagramFrameSize

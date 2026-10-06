@@ -18,8 +18,8 @@ import Testing
 
 @testable import NIOQUIC
 
-let p256PrivateKeyPath: String = Bundle.module.path(forResource: "privateKey", ofType: "der")!
-let p256PublicKeyPath: String = Bundle.module.path(forResource: "publicKey", ofType: "der")!
+let p256PrivateKeyPath: String = testResourcePath("privateKey", withExtension: "der")
+let p256PublicKeyPath: String = testResourcePath("publicKey", withExtension: "der")
 
 let privateKeyB64 =
     "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgAwx2URy4NAHA77bWmUT6k5cplHkFwelMaFOWHN1qyeyhRANCAARVi0dP1kVNh4FvNibyhsbOkFFFXy9GFzuS/e4c2eG9BwiQ3SS48L7J+ekRfoPi9AIDoElOCi7l2jwjy3sBbVxN"

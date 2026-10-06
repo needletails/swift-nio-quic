@@ -53,11 +53,12 @@ struct QUICStreamCore: ~Copyable {
     /// The handle used to talk to the SwiftNetwork stack.
     private var handle: SwiftNetworkStreamHandle
 
-    /// The reference every linkage call is made "from".
-    ///
-    /// Holding it creates a retain cycle (the ref, holds the container, holds this stream) which
-    /// is broken in ``close(error:)``.
-    private var reference: ProtocolInstanceReference
+    /// The identifier every linkage call is made "from".
+    private var identifier: InstanceIdentifier
+
+    /// The context that owns this stream's event state.
+    /// The connection's entry into its SwiftNetwork stack, or `nil` until the core is attached.
+    private var stack: SwiftNetworkStackAccess?
 
     #if DEBUG
     /// Whether attach has been called yet.
@@ -68,11 +69,17 @@ struct QUICStreamCore: ~Copyable {
     /// the leading frame doesn't contain enough bytes.
     private var coalescedBytes: [UInt8]
 
-    init(id: QUICStreamID?, reference: ProtocolInstanceReference, linkage: OutboundStreamLinkage) {
+    init(
+        id: QUICStreamID?,
+        identifier: InstanceIdentifier,
+        stack: SwiftNetworkStackAccess,
+        linkage: BaseOutboundStreamLinkage
+    ) {
         self.id = id
         self.state = QUICStreamStateMachine()
         self.handle = SwiftNetworkStreamHandle(linkage: linkage)
-        self.reference = reference
+        self.identifier = identifier
+        self.stack = stack
         self.pendingWrites = FrameArray()
         self.undeliveredReads = FrameArray()
         self.finPending = false
@@ -88,7 +95,8 @@ struct QUICStreamCore: ~Copyable {
         self.id = id
         self.state = QUICStreamStateMachine()
         self.handle = SwiftNetworkStreamHandle()
-        self.reference = ProtocolInstanceReference()
+        self.identifier = InstanceIdentifier()
+        self.stack = nil
         self.pendingWrites = FrameArray()
         self.undeliveredReads = FrameArray()
         self.finPending = false
@@ -99,23 +107,56 @@ struct QUICStreamCore: ~Copyable {
     /// Attaches this stream core to the stack.
     ///
     /// - Parameters:
-    ///   - reference: The reference the stack routes this stream's events back through, which is
-    ///     also what every linkage call is made "from".
+    ///   - identifier: The identifier the stack routes this stream's events back through.
+    ///   - stack: The connection's entry into the stack.
     ///   - linkage: The flow the stack attached for this stream.
-    mutating func attach(reference: ProtocolInstanceReference, linkage: OutboundStreamLinkage) {
+    mutating func attach(
+        identifier: InstanceIdentifier,
+        stack: SwiftNetworkStackAccess,
+        linkage: BaseOutboundStreamLinkage
+    ) {
         #if DEBUG
         assert(!self.hasAttached, "\(#function) called more than once")
         self.hasAttached = true
         #endif
-        self.reference = reference
+        self.identifier = identifier
+        self.stack = stack
         self.handle = SwiftNetworkStreamHandle(linkage: linkage)
+    }
+
+    /// Runs `body` with the stack's event context.
+    ///
+    /// The handle starts out with a stub linkage, so a core which was never attached can still
+    /// reach here; there is no stack to talk to then, which is reported as `invalidStreamState`.
+    private func withEventContext<R: ~Copyable>(
+        _ body: (inout NetworkContext.EventContext) throws -> R
+    ) throws -> R {
+        guard let stack = self.stack else { throw QUICError.invalidStreamState }
+        return try stack.withEventContext(self.identifier, body)
+    }
+
+    /// Runs `body` with the stack's event context, passing `frames` through to it.
+    ///
+    /// A core which was never attached has no stack to send to, so the frames fail instead, as
+    /// the stack does for a linkage which is no longer attached.
+    private func withEventContext(
+        _ frames: consuming FrameArray,
+        _ body: (inout NetworkContext.EventContext, consuming FrameArray) throws -> Void
+    ) throws {
+        guard let stack = self.stack else {
+            frames.finalizeAllFramesAsFailed()
+            return
+        }
+        try stack.withEventContext(self.identifier, frames, body)
     }
 
     /// The stack's metadata for this stream, or `nil` if it is detached.
     func metadata() -> ProtocolMetadata<QUICProtocol>? {
         switch self.handle.invokeGetMetadata() {
         case .proceed(let linkage):
-            return linkage.invokeGetMetadata(self.reference) as ProtocolMetadata<QUICProtocol>?
+            return try? self.withEventContext { eventContext in
+                linkage.invokeGetMetadata(for: self.identifier, in: &eventContext) as ProtocolMetadata<QUICProtocol>?
+            }
         case .ignore:
             return nil
         }
@@ -375,12 +416,15 @@ extension QUICStreamCore {
 
         switch self.handle.invokeReceiveStreamData() {
         case .proceed(let linkage):
-            do throws(NetworkError) {
-                received = try linkage.invokeReceiveStreamData(
-                    self.reference,
-                    minimumBytes: 1,
-                    maximumBytes: .max
-                )
+            do {
+                received = try self.withEventContext { eventContext in
+                    try linkage.invokeReceiveStreamData(
+                        minimumBytes: 1,
+                        maximumBytes: .max,
+                        for: self.identifier,
+                        in: &eventContext
+                    )
+                }
             } catch {
                 // Nothing readable: the stack reports what went wrong as a disconnect event
                 // rather than through this call.
@@ -520,8 +564,13 @@ extension QUICStreamCore {
     var writableBytes: Int {
         switch self.handle.invokeSendStreamData() {
         case .proceed(let linkage):
-            do throws(NetworkError) {
-                return try linkage.invokeGetOutboundStreamDataRoomAvailable(self.reference)
+            do {
+                return try self.withEventContext { eventContext in
+                    try linkage.invokeGetOutboundStreamDataRoomAvailable(
+                        for: self.identifier,
+                        in: &eventContext
+                    )
+                }
             } catch {
                 return 0  // Not connected, or the stack has finished with the send side.
             }
@@ -645,7 +694,9 @@ extension QUICStreamCore {
         switch self.handle.invokeSendStreamData() {
         case .proceed(let linkage):
             let outgoing = self.pendingWrites.drainArray()
-            try linkage.invokeSendStreamData(self.reference, streamData: outgoing)
+            try self.withEventContext(outgoing) { eventContext, outgoing in
+                try linkage.invokeSendStreamData(outgoing, from: self.identifier, in: &eventContext)
+            }
 
         case .handleViolation(let reason):
             self.pendingWrites.finalizeAllFramesAsFailed()
@@ -746,15 +797,19 @@ extension QUICStreamCore {
 
         switch self.handle.invokeDisconnect() {
         case .proceed(let linkage):
-            linkage.invokeDisconnect(self.reference, error: error)
+            try? self.withEventContext { eventContext in
+                linkage.invokeDisconnect(error: error, for: self.identifier, in: &eventContext)
+            }
         case .ignore:
             ()  // Already detached.
         }
 
         switch self.handle.invokeDetach() {
         case .proceed(let linkage):
-            do throws(NetworkError) {
-                try linkage.invokeDetach(self.reference)
+            do {
+                try self.withEventContext { eventContext in
+                    try linkage.invokeDetach(for: self.identifier, in: &eventContext)
+                }
             } catch {
                 ()  // The stack has already let go of its side.
             }
@@ -767,14 +822,16 @@ extension QUICStreamCore {
         self.finPending = false
         self.coalescedBytes = []
         // Breaks the cycle through the container which owns this stream's slot.
-        self.reference = ProtocolInstanceReference()
+        self.identifier = InstanceIdentifier()
     }
 
     private func abortInbound(error: NetworkError?) {
         switch self.handle.invokeAbortInbound() {
         case .proceed(let linkage):
-            do throws(NetworkError) {
-                try linkage.invokeAbortInbound(self.reference, error: error)
+            do {
+                try self.withEventContext { eventContext in
+                    try linkage.invokeAbortInbound(error: error, for: self.identifier, in: &eventContext)
+                }
             } catch {
                 ()  // The stack has already torn the receive side down.
             }
@@ -786,8 +843,10 @@ extension QUICStreamCore {
     private func abortOutbound(error: NetworkError?) {
         switch self.handle.invokeAbortOutbound() {
         case .proceed(let linkage):
-            do throws(NetworkError) {
-                try linkage.invokeAbortOutbound(self.reference, error: error)
+            do {
+                try self.withEventContext { eventContext in
+                    try linkage.invokeAbortOutbound(error: error, for: self.identifier, in: &eventContext)
+                }
             } catch {
                 ()  // The stack has already torn the send side down.
             }

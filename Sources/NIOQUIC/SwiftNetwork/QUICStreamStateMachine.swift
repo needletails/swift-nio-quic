@@ -15,12 +15,14 @@
 import NIOQUICHelpers
 @_spi(Essentials) @_spi(ProtocolProvider) import SwiftNetwork
 
-#if canImport(Glibc)
+#if canImport(Android)
+import Android
+#elseif canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
 import Glibc
 #elseif canImport(Musl)
 import Musl
-#elseif canImport(Darwin)
-import Darwin
 #endif
 
 enum WrappedStreamStateCriticalError {
@@ -2349,18 +2351,18 @@ struct SwiftNetworkStreamHandle: ~Copyable {
     }
 
     private var stateMachine: StateMachine
-    private var linkage: OutboundStreamLinkage
+    private var linkage: BaseOutboundStreamLinkage
 
     /// Initialise with a stub linkage (the outbound starting state, before
-    /// `invokeConnect` wires up a real reference).
+    /// `invokeConnect` wires up a real identifier).
     init() {
         self.stateMachine = StateMachine()
-        self.linkage = OutboundStreamLinkage(reference: .init())
+        self.linkage = BaseOutboundStreamLinkage()
     }
 
     /// Initialise with a specific linkage. Used by the inbound init path
-    /// once `invokeAttachUpperStreamProtocolToNewFlow` has succeeded.
-    init(linkage: OutboundStreamLinkage) {
+    /// once `attachUpperProtocolToNewFlow` has succeeded.
+    init(linkage: BaseOutboundStreamLinkage) {
         self.stateMachine = StateMachine()
         self.linkage = linkage
     }
@@ -2373,9 +2375,8 @@ struct SwiftNetworkStreamHandle: ~Copyable {
     // MARK: - Wrapper methods
     //
     // Every wrapper here returns an action that, on the success path, carries
-    // a *value snapshot* of `self.linkage` (`OutboundStreamLinkage` is a
-    // `struct` wrapping a struct `ProtocolInstanceReference`). Callers extract
-    // the linkage from the action, which releases the borrow on
+    // a *value snapshot* of `self.linkage` (`BaseOutboundStreamLinkage`).
+    // Callers extract the linkage from the action, which releases the borrow on
     // `self.swiftNetworkStreamHandle`, and then perform the SwiftNetwork side
     // effect on the local value. This is load-bearing: SwiftNetwork's
     // `handleCallFromUpperProtocol` drains queued peer events in a `defer`
@@ -2387,7 +2388,7 @@ struct SwiftNetworkStreamHandle: ~Copyable {
     // the side effect makes the re-entry safe at the language level.
 
     enum InvokeConnectAction: ~Copyable {
-        case proceed(OutboundStreamLinkage)
+        case proceed(BaseOutboundStreamLinkage)
         case handleViolation(StateMachine.ViolationReason)
     }
 
@@ -2401,7 +2402,7 @@ struct SwiftNetworkStreamHandle: ~Copyable {
     }
 
     enum InvokeDisconnectAction: ~Copyable {
-        case proceed(OutboundStreamLinkage)
+        case proceed(BaseOutboundStreamLinkage)
         case ignore
     }
 
@@ -2415,7 +2416,7 @@ struct SwiftNetworkStreamHandle: ~Copyable {
     }
 
     enum InvokeAbortInboundAction: ~Copyable {
-        case proceed(OutboundStreamLinkage)
+        case proceed(BaseOutboundStreamLinkage)
         case ignore
     }
 
@@ -2429,7 +2430,7 @@ struct SwiftNetworkStreamHandle: ~Copyable {
     }
 
     enum InvokeAbortOutboundAction: ~Copyable {
-        case proceed(OutboundStreamLinkage)
+        case proceed(BaseOutboundStreamLinkage)
         case ignore
     }
 
@@ -2443,7 +2444,7 @@ struct SwiftNetworkStreamHandle: ~Copyable {
     }
 
     enum InvokeSendStreamDataAction: ~Copyable {
-        case proceed(OutboundStreamLinkage)
+        case proceed(BaseOutboundStreamLinkage)
         case handleViolation(StateMachine.ViolationReason)
     }
 
@@ -2457,7 +2458,7 @@ struct SwiftNetworkStreamHandle: ~Copyable {
     }
 
     enum InvokeReceiveStreamDataAction: ~Copyable {
-        case proceed(OutboundStreamLinkage)
+        case proceed(BaseOutboundStreamLinkage)
         case handleViolation(StateMachine.ViolationReason)
     }
 
@@ -2471,7 +2472,7 @@ struct SwiftNetworkStreamHandle: ~Copyable {
     }
 
     enum InvokeGetMetadataAction: ~Copyable {
-        case proceed(OutboundStreamLinkage)
+        case proceed(BaseOutboundStreamLinkage)
         case ignore
     }
 
@@ -2485,7 +2486,7 @@ struct SwiftNetworkStreamHandle: ~Copyable {
     }
 
     enum InvokeDetachAction: ~Copyable {
-        case proceed(OutboundStreamLinkage)
+        case proceed(BaseOutboundStreamLinkage)
         case skipAlreadyDetached
     }
 
