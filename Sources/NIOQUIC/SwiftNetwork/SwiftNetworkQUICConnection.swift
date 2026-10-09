@@ -440,9 +440,8 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             )
 
             if let streamHandler {
-                let connection = self.swiftNetworkQUICConnection
-                streamHandler.keepaliveConfigurator = { seconds, eventContext in
-                    connection.configureKeepalive(seconds: seconds, in: &eventContext)
+                streamHandler.keepaliveConfigurator = { [weak streamHandler] seconds, _ in
+                    streamHandler?.configureKeepaliveAfterDelivery(seconds: seconds)
                 }
                 self.pendingInitialClientStream = streamHandler
             } else {

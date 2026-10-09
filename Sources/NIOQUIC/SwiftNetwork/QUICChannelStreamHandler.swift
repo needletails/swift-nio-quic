@@ -130,6 +130,17 @@ final class QUICChannelStreamHandler: ExternalInboundStreamLinkage, ProtocolInst
     var keepaliveConfigurator: ((UInt16, inout NetworkContext.EventContext) -> Void)?
     private var disconnectedEventHandler: ((NetworkError?) -> Void)?
 
+    /// Applies the keep-alive interval through `QUICConnectionMetadata.setKeepalive(keepAlive:)`.
+    ///
+    /// That setter enters the stack on its own, so it must not run while the connected delivery
+    /// still holds the event context. It runs on the next event-loop tick instead, once the
+    /// delivery has returned.
+    internal func configureKeepaliveAfterDelivery(seconds: UInt16) {
+        self.eventLoop.execute { [weak self] in
+            self?.getStreamMetadata()?.connectionMetadata?.setKeepalive(keepAlive: seconds)
+        }
+    }
+
     internal init(
         role: Role,
         stack: SwiftNetworkStackAccess,

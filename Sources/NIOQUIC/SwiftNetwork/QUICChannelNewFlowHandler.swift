@@ -266,9 +266,8 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
                     connectionChannel: connectionChannel,
                     keepAliveInterval: keepAliveInterval
                 )
-                let connection = self.connection
-                streamHandler.keepaliveConfigurator = { seconds, eventContext in
-                    connection.configureKeepalive(seconds: seconds, in: &eventContext)
+                streamHandler.keepaliveConfigurator = { [weak streamHandler] seconds, _ in
+                    streamHandler?.configureKeepaliveAfterDelivery(seconds: seconds)
                 }
 
                 let linkage = try self.connection.attachUpperProtocolToExistingFlow(

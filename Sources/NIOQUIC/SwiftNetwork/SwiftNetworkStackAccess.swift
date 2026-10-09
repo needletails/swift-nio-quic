@@ -49,6 +49,20 @@ final class SwiftNetworkStackAccess: @unchecked Sendable {
         self.context = context
     }
 
+    /// Pairs an identifier with the stack's context so the stack can be entered from outside.
+    ///
+    /// `NetworkContext.eventContext` is internal to SwiftNetwork; the only public external entry
+    /// is `ProtocolInstance.fromExternal(_:)`, which derives the event context from `context`.
+    private struct ExternalEntry: ProtocolInstance, ~Copyable {
+        let context: NetworkContext
+        var identifier: InstanceIdentifier
+        var eventManager = ProtocolEventManager()
+    }
+
+    private func externalEntry(_ identifier: InstanceIdentifier) -> ExternalEntry {
+        ExternalEntry(context: self.context, identifier: identifier)
+    }
+
     /// Runs `body`, a delivery from the stack, lending `eventContext` to any call made back into the
     /// stack while it runs.
     func lending<R>(
@@ -72,7 +86,7 @@ final class SwiftNetworkStackAccess: @unchecked Sendable {
             return try body(&lent.pointee)
         }
         defer { self.runPendingOutsideDelivery() }
-        return try identifier.fromExternal(context: self.context) { eventContext in
+        return try self.externalEntry(identifier).fromExternal { eventContext in
             try withUnsafeMutablePointer(to: &eventContext) { pointer in
                 try self.lending(pointer) {
                     try body(&pointer.pointee)
@@ -93,7 +107,7 @@ final class SwiftNetworkStackAccess: @unchecked Sendable {
             return try body(&lent.pointee)
         }
         defer { self.runPendingOutsideDelivery() }
-        return try identifier.fromExternal(context: self.context) { eventContext in
+        return try self.externalEntry(identifier).fromExternal { eventContext in
             try withUnsafeMutablePointer(to: &eventContext) { pointer in
                 try self.lending(pointer) {
                     try body(&pointer.pointee)
@@ -118,7 +132,7 @@ final class SwiftNetworkStackAccess: @unchecked Sendable {
         // `body` can take it from.
         var parked: T? = consume value
         defer { self.runPendingOutsideDelivery() }
-        return try identifier.fromExternal(context: self.context) { eventContext in
+        return try self.externalEntry(identifier).fromExternal { eventContext in
             try withUnsafeMutablePointer(to: &eventContext) { pointer in
                 try self.lending(pointer) {
                     try body(&pointer.pointee, parked.take()!)
