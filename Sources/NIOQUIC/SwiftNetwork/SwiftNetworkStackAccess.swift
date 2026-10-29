@@ -78,27 +78,6 @@ final class SwiftNetworkStackAccess: @unchecked Sendable {
     ///
     /// Reuses the context of the call in progress if there is one; otherwise enters the stack from
     /// outside on behalf of `identifier`.
-    func withEventContext<R>(
-        _ identifier: InstanceIdentifier,
-        _ body: (inout NetworkContext.EventContext) throws -> R
-    ) throws -> R {
-        if let lent = self.lentEventContext {
-            return try body(&lent.pointee)
-        }
-        defer { self.runPendingOutsideDelivery() }
-        return try self.externalEntry(identifier).fromExternal { eventContext in
-            try withUnsafeMutablePointer(to: &eventContext) { pointer in
-                try self.lending(pointer) {
-                    try body(&pointer.pointee)
-                }
-            }
-        }
-    }
-
-    /// Runs `body` with the stack's event context.
-    ///
-    /// Reuses the context of the call in progress if there is one; otherwise enters the stack from
-    /// outside on behalf of `identifier`.
     func withEventContext<R: ~Copyable>(
         _ identifier: InstanceIdentifier,
         _ body: (inout NetworkContext.EventContext) throws -> R

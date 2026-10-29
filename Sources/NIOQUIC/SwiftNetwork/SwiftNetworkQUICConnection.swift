@@ -603,6 +603,11 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         onStreamReady:
             @escaping (Result<(streamID: QUICStreamID, handler: QUICChannelStreamHandler), any Error>) -> Void
     ) throws {
+        // Fail the stream the way teardown fails those it finds still opening.
+        guard !self.swiftNetworkQUICConnection.isTornDown else {
+            throw ChannelError.ioOnClosedChannel
+        }
+
         // Generate a new temporary ID for the stream.
         let temporaryID = self.temporaryIDGenerator.generate()
 
@@ -1961,5 +1966,16 @@ extension SwiftNetworkQUICConnection: QUICConnectionProtocol where Consumer: ~Co
 
     func flushDatagrams() {
         self.datagramTransport?.flush()
+    }
+}
+
+@available(anyAppleOS 26, *)
+extension SwiftNetwork.QUICConnection {
+    /// Whether SwiftNetwork has torn the connection down, which it does once the last flow on it detaches.
+    ///
+    /// A torn-down connection must not get a new flow: attaching a flow to a connection without any sets
+    /// the connection up, which traps once teardown has handed back the connection's event state.
+    var isTornDown: Bool {
+        self.identifier.isNone
     }
 }

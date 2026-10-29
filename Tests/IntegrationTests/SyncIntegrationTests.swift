@@ -683,6 +683,46 @@ final class ErrorCatchingHandler: ChannelInboundHandler, Sendable {
     }
 }
 
+/// Closes its connection when the connection becomes active, before the handlers after it learn that it is.
+@available(anyAppleOS 26, *)
+final class CloseOnActiveHandler: ChannelInboundHandler, Sendable {
+    typealias InboundIn = Never
+    typealias OutboundIn = Never
+
+    func channelActive(context: ChannelHandlerContext) {
+        context.close(promise: nil)
+        context.fireChannelActive()
+    }
+}
+
+/// Opens a unidirectional stream when its connection becomes active, and reports the outcome.
+@available(anyAppleOS 26, *)
+final class OpenStreamOnActiveHandler: ChannelInboundHandler, Sendable {
+    typealias InboundIn = Never
+    typealias OutboundIn = Never
+
+    private let streamCreator: NIOQUIC.QUICStreamCreator
+    private let opened: EventLoopPromise<Void>
+
+    /// Completes `opened` with the outcome of opening the stream, or fails it if the handler is
+    /// removed before the connection became active.
+    init(streamCreator: NIOQUIC.QUICStreamCreator, opened: EventLoopPromise<Void>) {
+        self.streamCreator = streamCreator
+        self.opened = opened
+    }
+
+    func channelActive(context: ChannelHandlerContext) {
+        self.streamCreator.assumeIsolated().createUnidirectionalStream { streamInitializer in
+            streamInitializer.channel.eventLoop.makeSucceededVoidFuture()
+        }.cascade(to: self.opened)
+        context.fireChannelActive()
+    }
+
+    func handlerRemoved(context: ChannelHandlerContext) {
+        self.opened.fail(ChannelError.alreadyClosed)
+    }
+}
+
 /// Captures a `QUICStopSendingEvent` delivered as a user inbound event and succeeds a promise.
 @available(anyAppleOS 26, *)
 final class StopSendingEventHandler: ChannelInboundHandler, Sendable {
@@ -1350,6 +1390,65 @@ final class SyncIntegrationTests: XCTestCase {
         XCTAssertEqual(error?.reason, "test")
         XCTAssertEqual(error?.code, 10)
 
+        try await serverChannel.close()
+    }
+
+    func testOpeningAStreamOnAClosedConnectionFails() async throws {
+        // Closing the connection tears it down in SwiftNetwork, yet the handlers after the one that
+        // closed it still see it become active, and may open a stream on it.
+        let eventLoopGroup = MultiThreadedEventLoopGroup.singleton
+        let loggers = getChannelLoggers()
+        let host = "127.0.0.1"
+        let opened = eventLoopGroup.any().makePromise(of: Void.self)
+
+        let serverChannel = try await createServerChannel(
+            eventLoopGroup: eventLoopGroup,
+            host: host,
+            port: 0,
+            logger: loggers.serverLogger,
+            inboundConnectionInitializer: { connectionChannel, streamCreator in
+                connectionChannel.eventLoop.makeCompletedFuture {
+                    try connectionChannel.pipeline.syncOperations.addHandlers(
+                        CloseOnActiveHandler(),
+                        OpenStreamOnActiveHandler(streamCreator: streamCreator, opened: opened)
+                    )
+                }
+            },
+            noMoreConnections: {}
+        ).get()
+        let serverPort = serverChannel.localAddress!.port!
+
+        let clientChannel = try await createClientChannel(
+            eventLoopGroup: eventLoopGroup,
+            host: host,
+            port: 0,
+            logger: loggers.clientLogger
+        ).get()
+
+        let (clientConnectionChannel, _) = try await clientChannel.pipeline.handler(
+            type: QUICHandler<QUICStreamChannels>.self
+        )
+        .flatMap { quicHandler in
+            quicHandler.createOutboundConnection(
+                serverName: "\(host):\(serverPort)",
+                remoteAddress: try! .init(ipAddress: host, port: serverPort),
+                connectionInitializer: { connectionChannel, _ in
+                    connectionChannel.eventLoop.makeSucceededVoidFuture()
+                },
+                inboundStreamInitializer: { streamChannel in
+                    streamChannel.eventLoop.makeSucceededVoidFuture()
+                }
+            )
+        }.get()
+
+        do {
+            try await opened.futureResult.get()
+            XCTFail("Opened a stream on a closed connection")
+        } catch {
+            XCTAssertEqual(error as? ChannelError, .ioOnClosedChannel)
+        }
+
+        try await clientConnectionChannel.closeFuture.get()
         try await serverChannel.close()
     }
 
