@@ -28,22 +28,24 @@ import Musl
 
 /// Implementation of `QUICDatagramProtocol` backed by a SwiftNetwork QUIC datagram flow.
 ///
-/// Conforms to SwiftNetwork's `InboundDatagramHandler` to receive inbound datagram events and
-/// `ProtocolInstanceContainer` to be addressable as a protocol instance; the connection which owns
-/// it talks to it only through `QUICDatagramProtocol`.
+/// Conforms to SwiftNetwork's `ExternalInboundDatagramLinkage` so the stack can deliver
+/// inbound datagram events. The connection which owns it talks to it only through
+/// `QUICDatagramProtocol`.
 @available(anyAppleOS 26, *)
 final class QUICDatagramTransport<Consumer: QUICStreamConsumer & ~Copyable>:
-    ProtocolInstanceContainer, InboundDatagramHandler
+    ExternalInboundDatagramLinkage, ProtocolInstance
 {
 
-    typealias LowerProtocol = OutboundDatagramLinkage
+    typealias LowerProtocol = BaseOutboundDatagramLinkage
 
-    internal var reference = ProtocolInstanceReference()
+    internal var identifier = InstanceIdentifier()
     internal var eventManager = ProtocolEventManager()
     /// The datagram flow this transport sends and receives on. Replaced with a live linkage by
     /// `setFlowLinkage(_:)` once the flow has been attached.
-    internal var lower: OutboundDatagramLinkage = .init(reference: .init())
-    internal var context: SwiftNetwork.NetworkContext
+    internal var lower = BaseOutboundDatagramLinkage()
+    /// The connection's entry into its SwiftNetwork stack.
+    internal let stack: SwiftNetworkStackAccess
+    internal var context: NetworkContext { self.stack.context }
 
     internal var logPrefix: String
     internal let logger: Logger
@@ -54,15 +56,15 @@ final class QUICDatagramTransport<Consumer: QUICStreamConsumer & ~Copyable>:
     /// The connection notified of inbound datagrams and errors.
     private var reader: SwiftNetworkQUICConnection<Consumer>?
 
-    init(role: Role, logger: Logger, context: NetworkContext) {
+    init(role: Role, logger: Logger, stack: SwiftNetworkStackAccess) {
         self.logPrefix = "[\(role.description)][DatagramTransport]"
         self.logger = logger
-        self.context = context
-        self.reference = ProtocolInstanceReference(custom: self)
+        self.stack = stack
+        self.identifier = stack.register(&self.eventManager)
     }
 
     /// Installs the flow linkage returned by attaching this transport to a new datagram flow.
-    func setFlowLinkage(_ linkage: OutboundDatagramLinkage) {
+    func setFlowLinkage(_ linkage: BaseOutboundDatagramLinkage) {
         self.lower = linkage
     }
 
@@ -88,20 +90,27 @@ extension QUICDatagramTransport: QUICDatagramProtocol where Consumer: ~Copyable 
 
     /// Sends all buffered datagrams if the flow is connected.
     func flush() {
-        guard self.bufferedDatagrams.count > 0, lower.isConnected else {
+        guard self.bufferedDatagrams.count > 0, !self.lower.isDetached else {
             return
         }
 
         do {
-            self.log("writing \(self.bufferedDatagrams.count) QUIC datagrams")
-            var frameArray = FrameArray(capacity: self.bufferedDatagrams.count)
-            for var datagram in self.bufferedDatagrams {
-                datagram.withUnsafeMutableReadableBytesWithStorageManagement2 { buffer, owner in
-                    frameArray.add(frame: Frame(customBuffer: buffer, owner: owner))
+            try self.stack.withEventContext(self.identifier) { eventContext in
+                guard self.lower.isConnected(in: &eventContext) else { return }
+                self.log("writing \(self.bufferedDatagrams.count) QUIC datagrams")
+                var frameArray = FrameArray(capacity: self.bufferedDatagrams.count)
+                for var datagram in self.bufferedDatagrams {
+                    datagram.withUnsafeMutableReadableBytesWithStorageManagement2 { buffer, owner in
+                        frameArray.add(frame: Frame(customBuffer: buffer, owner: owner))
+                    }
                 }
+                try self.lower.invokeSendDatagrams(
+                    frameArray,
+                    from: self.identifier,
+                    in: &eventContext
+                )
+                self.bufferedDatagrams.removeAll(where: { _ in true })
             }
-            try lower.invokeSendDatagrams(self.reference, datagrams: frameArray)
-            self.bufferedDatagrams.removeAll(where: { _ in true })
         } catch {
             self.logger.error("QUIC send datagrams: \(error)")
             self.reader?.error(error)
@@ -118,12 +127,14 @@ extension QUICDatagramTransport: QUICDatagramProtocol where Consumer: ~Copyable 
         }
 
         // Cleanup linkage with SwiftNetwork.
-        do throws(NetworkError) {
-            try lower.invokeDetach(self.reference)
+        do {
+            try self.stack.withEventContext(self.identifier) { eventContext in
+                try self.lower.invokeDetach(for: self.identifier, in: &eventContext)
+            }
         } catch {
             self.logger.error("datagram flow detach failed: \(error)")
         }
-        self.reference = ProtocolInstanceReference()
+        self.stack.release(self)
 
         // Remove reference to reader.
         self.reader = nil
@@ -141,33 +152,43 @@ extension QUICDatagramTransport: QUICDatagramProtocol where Consumer: ~Copyable 
 extension QUICDatagramTransport where Consumer: ~Copyable {
     /// Drains all datagrams currently available on the flow and forwards each to the reader.
     /// Does nothing if no reader has been set.
-    func handleInboundDataAvailableEvent(_ from: ProtocolInstanceReference) {
+    func handleInboundDataAvailableEvent(
+        for instance: InstanceIdentifier,
+        in eventContext: inout NetworkContext.EventContext
+    ) {
         guard let reader = self.reader else {
             self.log("handle inbound data, but no reader set")
             return
         }
 
-        do throws(NetworkError) {
-            while var frames = try lower.invokeReceiveDatagrams(self.reference, maximumDatagramCount: .max),
-                frames.count > 0
-            {
-                frames.iterateMutableFrames { frame in
-                    frame.span?.withUnsafeBufferPointer { spanBuffer in
-                        var datagram = ByteBuffer()
-                        datagram.writeWithUnsafeMutableBytes(
-                            minimumWritableBytes: spanBuffer.count
-                        ) { buffer in
-                            buffer.copyMemory(from: UnsafeRawBufferPointer(spanBuffer))
-                            return spanBuffer.count
+        // The reader fires each datagram into the channel pipeline, which may write back.
+        self.stack.lending(&eventContext) {
+            do {
+                try self.stack.withEventContext(self.identifier) { eventContext in
+                    while var frames = try self.lower.invokeReceiveDatagrams(
+                        maximumDatagramCount: .max,
+                        for: self.identifier,
+                        in: &eventContext
+                    ), frames.count > 0 {
+                        frames.iterateMutableFrames { frame in
+                            frame.span?.withUnsafeBufferPointer { spanBuffer in
+                                var datagram = ByteBuffer()
+                                datagram.writeWithUnsafeMutableBytes(
+                                    minimumWritableBytes: spanBuffer.count
+                                ) { buffer in
+                                    buffer.copyMemory(from: UnsafeRawBufferPointer(spanBuffer))
+                                    return spanBuffer.count
+                                }
+                                reader.read(datagram: datagram)
+                            }
+                            frame.finalize(success: true)
+                            return true
                         }
-                        reader.read(datagram: datagram)
                     }
-                    frame.finalize(success: true)
-                    return true
                 }
+            } catch {
+                self.logger.error("QUIC datagram receive error: \(error)")
             }
-        } catch {
-            self.logger.error("QUIC datagram receive error: \(error)")
         }
     }
 }
@@ -175,43 +196,44 @@ extension QUICDatagramTransport where Consumer: ~Copyable {
 // Connection events are already handled by the `QUICChannelNewFlowHandler`.
 @available(anyAppleOS 26, *)
 extension QUICDatagramTransport where Consumer: ~Copyable {
-    func attachLowerDatagramProtocol(
-        _ lowerProtocol: SwiftNetwork.ProtocolInstanceReference,
-        remote: SwiftNetwork.Endpoint?,
-        local: SwiftNetwork.Endpoint?,
-        parameters: SwiftNetwork.Parameters?,
-        path: SwiftNetwork.PathProperties?
-    ) throws(SwiftNetwork.NetworkError) {
+    func invokeAttachLowerProtocol(
+        _ lowerProtocol: BaseOutboundDatagramLinkage,
+        remote: Endpoint?,
+        local: Endpoint?,
+        parameters: Parameters?,
+        path: PathProperties?
+    ) throws(NetworkError) {
         throw NetworkError.posix(ENOTSUP)
     }
 
-    func handleOutboundRoomAvailableEvent(_ from: SwiftNetwork.ProtocolInstanceReference) {
+    func handleOutboundRoomAvailableEvent(
+        for instance: InstanceIdentifier,
+        in eventContext: inout NetworkContext.EventContext
+    ) {
         // nop
     }
 
-    func attachLowerProtocol(
-        _ lowerProtocol: SwiftNetwork.ProtocolInstanceReference,
-        remote: SwiftNetwork.Endpoint?,
-        local: SwiftNetwork.Endpoint?,
-        parameters: SwiftNetwork.Parameters?,
-        path: SwiftNetwork.PathProperties?
-    ) throws(SwiftNetwork.NetworkError) {
-        throw NetworkError.posix(ENOTSUP)
-    }
-
-    func handleConnectedEvent(_ from: SwiftNetwork.ProtocolInstanceReference) {
+    func handleConnectedEvent(
+        for instance: InstanceIdentifier,
+        in eventContext: inout NetworkContext.EventContext
+    ) {
         log("received connected event")
         // Defer connection-level handling to `SwiftNetworkQUICConnection`.
     }
 
-    func handleDisconnectedEvent(_ from: SwiftNetwork.ProtocolInstanceReference, error: SwiftNetwork.NetworkError?) {
+    func handleDisconnectedEvent(
+        error: NetworkError?,
+        for instance: InstanceIdentifier,
+        in eventContext: inout NetworkContext.EventContext
+    ) {
         log("received disconnected event, error \(error.debugDescription)")
         // Defer connection-level handling to `SwiftNetworkQUICConnection`.
     }
 
     func handleNetworkProtocolEvent(
-        _ from: SwiftNetwork.ProtocolInstanceReference,
-        event: SwiftNetwork.NetworkProtocolEvent
+        event: NetworkProtocolEvent,
+        for instance: InstanceIdentifier,
+        in eventContext: inout NetworkContext.EventContext
     ) {
         // nop
     }

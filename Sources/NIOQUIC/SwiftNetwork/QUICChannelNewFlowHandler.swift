@@ -34,17 +34,21 @@ import Musl
 /// for each new flow, registers it and keeps track of it.
 @available(anyAppleOS 26, *)
 final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
-    ProtocolInstanceContainer, InboundFlowHandler
+    ExternalInboundStreamFlowLinkage, ProtocolInstance
 {
 
-    internal typealias LowerProtocol = StreamListenerLinkage
     typealias UpperStreamHandlerType = QUICChannelStreamHandler
 
     // Internal mutable state
     internal var eventManager = ProtocolEventManager()
     internal var logPrefix: String
-    internal var reference: ProtocolInstanceReference { ProtocolInstanceReference(custom: self) }
-    internal var context: SwiftNetwork.NetworkContext
+    internal var identifier = InstanceIdentifier()
+    /// The connection's entry into its SwiftNetwork stack.
+    internal let stack: SwiftNetworkStackAccess
+    internal var context: NetworkContext { self.stack.context }
+    private var connection: SwiftNetwork.QUICConnection
+    /// The linkage control calls reach the connection through.
+    private let listener: BaseStreamListenerLinkage
 
     // Private constant state
     let local: Endpoint
@@ -64,9 +68,6 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
     // an implicitly unwrapped optionals because Swift's initialization rules prevent
     // passing 'self' method references during init.
     private var connectionView: SwiftNetworkQUICConnection<Consumer>.NewFlowView!
-    private var lowerProtocol: LowerProtocol?
-
-    private var datagramListener: DatagramListenerLinkage
 
     // Internal mutable state
     var keepAliveInterval: Duration?
@@ -78,31 +79,34 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
     internal init?(
         local: Endpoint,
         remote: Endpoint,
+        stack: SwiftNetworkStackAccess,
         parameters: Parameters,
         path: PathProperties,
         logger: Logger,
         remoteAddress: SendableAddress,
         localAddress: SocketAddress,
         role: Role,
-        streamListenerProtocol: StreamListenerLinkage,
-        datagramListenerProtocol: DatagramListenerLinkage,
+        connection: SwiftNetwork.QUICConnection,
+        listener: BaseStreamListenerLinkage,
         keepAliveInterval: Duration? = nil
     ) {
         self.local = local
         self.remote = remote
+        self.stack = stack
         self.parameters = parameters
         self.path = path
         self.role = role
         self.logger = logger
         self.remoteAddress = remoteAddress
-        self.context = parameters.context
         self.keepAliveInterval = keepAliveInterval
         self.logPrefix = "[\(self.role.description)][NewFlowHandler]"
         self.localAddress = localAddress
-        self.datagramListener = datagramListenerProtocol
+        self.connection = connection
+        self.listener = listener
+        self.identifier = stack.register(&self.eventManager)
         do throws(NetworkError) {
-            self.lowerProtocol = try streamListenerProtocol.invokeAttachNewStreamFlowProtocol(
-                self.reference,
+            try self.connection.attachUpperProtocol(
+                BaseInboundStreamFlowLinkage(external: self),
                 remote: remote,
                 local: local,
                 parameters: parameters,
@@ -142,9 +146,8 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
     func start(_ view: SwiftNetworkQUICConnection<Consumer>.NewFlowView) {
         log("start")
         self.connectionView = view
-        let reference = self.reference
-        reference.fromExternal {
-            self.lowerProtocol?.invokeConnect(reference)
+        try? self.stack.withEventContext(self.identifier) { eventContext in
+            self.listener.invokeConnect(for: self.identifier, in: &eventContext)
         }
     }
 
@@ -152,68 +155,79 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
     // `connectionMetadata.activeConnectionIDLimit` is the peer's advertised cap
     // on how many connection IDs we may issue (RFC 9000 §18.2).
     func getConnectionMetadata() -> ProtocolMetadata<QUICProtocol>? {
-        let reference = self.reference
-        return reference.fromExternal {
-            self.lowerProtocol?.invokeGetMetadata(reference) as? ProtocolMetadata<QUICProtocol>
+        try? self.stack.withEventContext(self.identifier) { eventContext in
+            self.listener.invokeGetMetadata(for: self.identifier, in: &eventContext) as ProtocolMetadata<QUICProtocol>?
         }
     }
 
     // Stop the new flow handler
     func stop(error: NetworkError? = nil) {
         log("stop")
-        let reference = self.reference
-        reference.fromExternal {
-            self.lowerProtocol?.invokeDisconnect(reference, error: error)
+        try? self.stack.withEventContext(self.identifier) { eventContext in
+            self.listener.invokeDisconnect(error: error, for: self.identifier, in: &eventContext)
         }
     }
 
     // Teardown the new flow handler
     internal func teardown() {
-        let reference = self.reference
-        reference.fromExternal {
+        try? self.stack.withEventContext(self.identifier) { eventContext in
             do throws(NetworkError) {
-                let lower = self.lowerProtocol.take()
-                try lower?.invokeDetach(reference)
+                try self.listener.invokeDetach(for: self.identifier, in: &eventContext)
             } catch {
                 self.log("Failed to detach lower protocol: \(error)")
             }
         }
+        self.stack.release(self)
     }
 
     func outboundBatching(_ isEnabled: Bool) {
         let event: ApplicationEvent = isEnabled ? .outboundDataBatchStart : .outboundDataBatchEnd
-        let reference = self.reference
-        reference.fromExternal {
-            self.lowerProtocol?.invokeApplicationEvent(reference, event: event)
+        try? self.stack.withEventContext(self.identifier) { eventContext in
+            self.listener.invokeApplicationEvent(event: event, for: self.identifier, in: &eventContext)
         }
     }
 
-    // Received connected event
-    func handleConnectedEvent(_ from: SwiftNetwork.ProtocolInstanceReference) {
+    func handleConnectedEvent(
+        for instance: InstanceIdentifier,
+        in eventContext: inout NetworkContext.EventContext
+    ) {
         log("connected received")
-        self.connectionView.connected()
+        self.stack.lending(&eventContext) {
+            self.connectionView.connected()
+        }
     }
 
-    // Received disconnected event
-    func handleDisconnectedEvent(_ from: SwiftNetwork.ProtocolInstanceReference, error: SwiftNetwork.NetworkError?) {
+    func handleDisconnectedEvent(
+        error: SwiftNetwork.NetworkError?,
+        for instance: InstanceIdentifier,
+        in eventContext: inout NetworkContext.EventContext
+    ) {
         log("received disconnected with error: \(String(describing: error))")
-        self.connectionView.disconnected(error: error)
+        self.stack.lending(&eventContext) {
+            self.connectionView.disconnected(error: error)
+        }
         self.connectionView = nil
+    }
+
+    func invokeAttachLowerProtocol(
+        _ lowerProtocol: BaseStreamListenerLinkage,
+        remote: Endpoint?,
+        local: Endpoint?,
+        parameters: Parameters?,
+        path: PathProperties?
+    ) throws(NetworkError) {
+        throw NetworkError.posix(ENOTSUP)
     }
 
     // Receive a new inbound flow and either give it a slot in the stream table or
     // create a QUICChannelStreamHandler for it.
     internal func handleNewInboundFlowEvent(
-        _ from: ProtocolInstanceReference,
-        flowReference: ProtocolInstanceReference,
-        flowMetadata: AbstractProtocolMetadata?
+        flowInstance: InstanceIdentifier,
+        flowMetadata: AbstractProtocolMetadata?,
+        for instance: InstanceIdentifier,
+        in eventContext: inout NetworkContext.EventContext
     ) {
         log("received new inbound flow")
-
-        guard let lowerProtocol = self.lowerProtocol else {
-            self.log("Dropping new inbound flow: lower protocol has been detached")
-            return
-        }
 
         guard let metadata = flowMetadata as? ProtocolMetadata<QUICProtocol>,
             let inputHandlerStreamID = metadata.streamID
@@ -222,31 +236,43 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
             return
         }
 
+        self.stack.lending(&eventContext) {
+            self.handleNewInboundFlow(
+                flowInstance: flowInstance,
+                metadata: metadata,
+                streamID: QUICStreamID(rawValue: inputHandlerStreamID)
+            )
+        }
+    }
+
+    private func handleNewInboundFlow(
+        flowInstance: InstanceIdentifier,
+        metadata: ProtocolMetadata<QUICProtocol>,
+        streamID: QUICStreamID
+    ) {
         // Before the connection channel is required below: a connection using a stream
         // table has no child channel to parent the stream to.
         if let table = self.streamTable {
-            self.attachInboundFlowToTable(
-                table,
-                lowerProtocol: lowerProtocol,
-                flowReference: flowReference,
-                streamID: QUICStreamID(rawValue: inputHandlerStreamID)
-            )
+            self.attachInboundFlowToTable(table, flowInstance: flowInstance, streamID: streamID)
         } else if let connectionChannel = self.connectionChannel {
             do throws(NetworkError) {
                 let streamHandler = QUICChannelStreamHandler(
                     role: self.role,
-                    parameters: self.parameters,
-                    streamID: QUICStreamID(rawValue: inputHandlerStreamID),
+                    stack: self.stack,
+                    streamID: streamID,
                     logger: self.logger,
                     remoteAddress: self.remoteAddress,
                     localAddress: self.localAddress,
                     connectionChannel: connectionChannel,
                     keepAliveInterval: keepAliveInterval
                 )
+                streamHandler.keepaliveConfigurator = { [weak streamHandler] seconds, _ in
+                    streamHandler?.configureKeepaliveAfterDelivery(seconds: seconds)
+                }
 
-                let linkage = try lowerProtocol.invokeAttachUpperStreamProtocolToExistingFlow(
-                    streamHandler.reference,
-                    flowReference: flowReference
+                let linkage = try self.connection.attachUpperProtocolToExistingFlow(
+                    BaseInboundStreamLinkage(external: streamHandler),
+                    existingFlowInstance: flowInstance
                 )
                 streamHandler.swiftNetworkStreamHandle = SwiftNetworkStreamHandle(linkage: linkage)
                 streamHandler.setNewFlowMetadata(metadata)
@@ -266,19 +292,17 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
 
     private func attachInboundFlowToTable(
         _ table: QUICStreamTable<Consumer>,
-        lowerProtocol: LowerProtocol,
-        flowReference: ProtocolInstanceReference,
+        flowInstance: InstanceIdentifier,
         streamID: QUICStreamID
     ) {
         // No state: the consumer makes it in 'makeStreamState' before the first visit.
         let handle = table.insertSlot(id: streamID, state: nil)
-        let reference = table.reference(for: handle)
-
-        let linkage: OutboundStreamLinkage
+        let proxy = table.external(for: handle)
+        let linkage: BaseOutboundStreamLinkage
         do throws(NetworkError) {
-            linkage = try lowerProtocol.invokeAttachUpperStreamProtocolToExistingFlow(
-                reference,
-                flowReference: flowReference
+            linkage = try self.connection.attachUpperProtocolToExistingFlow(
+                BaseInboundStreamLinkage(external: proxy),
+                existingFlowInstance: flowInstance
             )
         } catch {
             self.log("Failed to attach new inbound flow: \(error)")
@@ -290,21 +314,34 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
             preconditionFailure("slot for \(handle) was recycled while its flow was attaching")
         }
 
-        transport.pointee.core.attach(reference: reference, linkage: linkage)
+        transport.pointee.core.attach(
+            identifier: proxy.identifier,
+            stack: self.stack,
+            linkage: linkage
+        )
 
         table.assignID(streamID, to: handle)
-        linkage.invokeConnect(reference)
+        try? self.stack.withEventContext(proxy.identifier) { eventContext in
+            linkage.invokeConnect(for: proxy.identifier, in: &eventContext)
+        }
         table.markReady(handle: handle, events: [.opened, .readable])
     }
 }
 
 @available(anyAppleOS 26, *)
-extension QUICChannelNewFlowHandler: UpperProtocolHandler where Consumer: ~Copyable {
+extension QUICChannelNewFlowHandler where Consumer: ~Copyable {
     func handleNetworkProtocolEvent(
-        _ from: SwiftNetwork.ProtocolInstanceReference,
-        event: SwiftNetwork.NetworkProtocolEvent
+        event: SwiftNetwork.NetworkProtocolEvent,
+        for instance: InstanceIdentifier,
+        in eventContext: inout NetworkContext.EventContext
     ) {
-        self.log("Network protocol event from \(from): \(event)")
+        self.log("Network protocol event from \(instance): \(event)")
+        self.stack.lending(&eventContext) {
+            self.handleNetworkProtocolEvent(event)
+        }
+    }
+
+    private func handleNetworkProtocolEvent(_ event: SwiftNetwork.NetworkProtocolEvent) {
         if let quicEvent = event.quicEvent {
             switch quicEvent {
             case .newInboundConnectionID(let connectionID):
@@ -339,21 +376,14 @@ extension QUICChannelNewFlowHandler: UpperProtocolHandler where Consumer: ~Copya
                 self.connectionView.pathValidated(remote: info.remote)
             case .pathUnreachable(let info):
                 self.connectionView.pathUnreachable(remote: info.remote)
+            case .pathCIDAssigned:
+                break
+            case .pathCurrent:
+                break
             }
         } else {
             // There might be more that we are interested in.
         }
-    }
-
-    // Conform to UpperProtocolHandler but the function is unused
-    func attachLowerProtocol(
-        _ lowerProtocol: SwiftNetwork.ProtocolInstanceReference,
-        remote: SwiftNetwork.Endpoint?,
-        local: SwiftNetwork.Endpoint?,
-        parameters: SwiftNetwork.Parameters?,
-        path: SwiftNetwork.PathProperties?
-    ) throws(SwiftNetwork.NetworkError) {
-        throw NetworkError.posix(EINVAL)
     }
 
     // Request association of a new connection ID that our peer can use to contact us.
@@ -371,9 +401,8 @@ extension QUICChannelNewFlowHandler: UpperProtocolHandler where Consumer: ~Copya
         )
         let event = ApplicationEvent(quicEvent: quicEvent)
 
-        let reference = self.reference
-        reference.fromExternal {
-            self.lowerProtocol?.invokeApplicationEvent(reference, event: event)
+        try? self.stack.withEventContext(self.identifier) { eventContext in
+            self.listener.invokeApplicationEvent(event: event, for: self.identifier, in: &eventContext)
         }
     }
 
@@ -385,9 +414,8 @@ extension QUICChannelNewFlowHandler: UpperProtocolHandler where Consumer: ~Copya
         let quicEvent = QUICApplicationEvent.retireOutboundConnectionID(cid)
         let event = ApplicationEvent(quicEvent: quicEvent)
 
-        let reference = self.reference
-        reference.fromExternal {
-            self.lowerProtocol?.invokeApplicationEvent(reference, event: event)
+        try? self.stack.withEventContext(self.identifier) { eventContext in
+            self.listener.invokeApplicationEvent(event: event, for: self.identifier, in: &eventContext)
         }
     }
 }
@@ -407,29 +435,40 @@ extension QUICChannelNewFlowHandler where Consumer: ~Copyable {
             let transport = QUICDatagramTransport<Consumer>(
                 role: self.role,
                 logger: self.logger,
-                context: self.context
+                stack: self.stack
             )
 
             var swiftNetworkParameters = SwiftNetwork.Parameters()
-            swiftNetworkParameters.context = self.context
+            swiftNetworkParameters.context = self.stack.context
             let swiftNetworkPath = SwiftNetwork.PathProperties(parameters: swiftNetworkParameters)
             let quicOptions = QUICStreamProtocol.options()
-            guard let perProtocolOptions = quicOptions.perProtocolOptions else {
+            guard quicOptions.perProtocolOptions != nil else {
                 throw QUICError.invalidConfiguration
             }
-            perProtocolOptions.isDatagram = true
-            quicOptions.setProtocolInstance(self.datagramListener.reference)
+            quicOptions.modifyPerProtocolOptions { $0.isDatagram = true }
+            quicOptions.setProtocolInstance(self.connection.identifier)
             swiftNetworkParameters.defaultStack.prepend(applicationProtocol: quicOptions)
 
-            let linkage = try self.datagramListener.invokeAttachUpperDatagramProtocolToNewFlow(
-                transport.reference,
+            let upper = BaseInboundDatagramLinkage(external: transport)
+            let linkage = try self.connection.attachUpperProtocolToNewFlow(
+                upper,
+                remote: nil,
+                local: nil,
+                parameters: swiftNetworkParameters,
+                path: swiftNetworkPath
+            )
+            // The second leg runs the flow's setup, which sizes the datagrams it can carry.
+            try linkage.invokeAttachUpperProtocol(
+                upper,
                 remote: nil,
                 local: nil,
                 parameters: swiftNetworkParameters,
                 path: swiftNetworkPath
             )
             transport.setFlowLinkage(linkage)
-            linkage.invokeConnect(transport.reference)
+            try? self.stack.withEventContext(transport.identifier) { eventContext in
+                linkage.invokeConnect(for: transport.identifier, in: &eventContext)
+            }
 
             return transport
         } catch {

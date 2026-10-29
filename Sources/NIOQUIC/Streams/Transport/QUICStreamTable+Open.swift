@@ -34,26 +34,33 @@ extension QUICStreamTable where Consumer: ~Copyable {
             throw QUICError.invalidStreamTypeForRole
         }
 
-        guard let opener = self.opener else { throw QUICError.invalidStreamState }
+        guard var opener = self.opener else { throw QUICError.invalidStreamState }
 
         let handle = self.insertSlot(id: nil, state: consume state)
-        let reference = self.reference(for: handle)
-        let linkage: OutboundStreamLinkage
+        let proxy = self.external(for: handle)
+        let upper = BaseInboundStreamLinkage(external: proxy)
+        let linkage: BaseOutboundStreamLinkage
 
         do throws(NetworkError) {
-            linkage = try opener.attach(isUnidirectional: type.isUnidirectional, from: reference)
+            linkage = try opener.attach(isUnidirectional: type.isUnidirectional, upper: upper)
         } catch {
             self.vacateSlot(handle)
             throw QUICError.invalidStreamState
         }
 
         if let transport = self.transportState(for: handle) {
-            transport.pointee.core.attach(reference: reference, linkage: linkage)
+            transport.pointee.core.attach(
+                identifier: proxy.identifier,
+                stack: self.stack,
+                linkage: linkage
+            )
         } else {
             preconditionFailure("slot for \(handle) was recycled while its stream was being opened")
         }
 
-        linkage.invokeConnect(reference)
+        try? self.stack.withEventContext(proxy.identifier) { eventContext in
+            linkage.invokeConnect(for: proxy.identifier, in: &eventContext)
+        }
         return handle
     }
 }

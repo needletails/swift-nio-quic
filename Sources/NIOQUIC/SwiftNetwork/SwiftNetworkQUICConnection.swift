@@ -90,6 +90,8 @@ final class SendableAddress: Sendable {
 @available(anyAppleOS 26, *)
 final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable> {
     private var swiftNetworkQUICConnection: SwiftNetwork.QUICConnection
+    /// Owns `swiftNetworkQUICConnection` on the stack's behalf.
+    private let protocolStorage: BaseNetworkProtocolStorage
     let localAddress: SocketAddress
     // The address of the active path, shared with this connection's channels.
     let remoteAddress: SendableAddress
@@ -142,7 +144,8 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     private var connectionStateMachine = QUICConnectionStateMachine()
 
     private var finalizedOutput: Deque<ByteBuffer> = []
-    private var networkContext: NetworkContext
+    /// The connection's entry into its SwiftNetwork stack.
+    private let stack: SwiftNetworkStackAccess
 
     private var streamOptions: QUICStreamProtocol.QUICStreamOptions
 
@@ -354,7 +357,8 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             externalScheduler: EventLoopBackedScheduler(eventLoop: eventLoop)
         )
         swiftNetworkParameters.context = networkContext
-        self.networkContext = networkContext
+        let stack = SwiftNetworkStackAccess(context: networkContext)
+        self.stack = stack
         swiftNetworkParameters.isServer = self.role == .server
 
         let quicOptions = try QUICStreamProtocol.options(from: configuration)
@@ -398,7 +402,14 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         }
         self.streamOptions = perProtocolOptions
 
-        let swiftNetworkQUICConnection = SwiftNetwork.QUICConnection(context: swiftNetworkParameters.context)
+        // The storage owns the QUIC instance and hands out the linkages which reach it; the
+        // listener linkage is what the flow handler above the connection talks to it through.
+        let storage = BaseNetworkProtocolStorage(context: networkContext)
+        let (streamListener, _, _) = storage.createQUICInstance()
+        guard let swiftNetworkQUICConnection = storage.quicInstance(for: streamListener) else {
+            fatalError("storage did not create a QUIC instance")
+        }
+        self.protocolStorage = storage
         self.swiftNetworkParameters = swiftNetworkParameters
         self.swiftNetworkQUICConnection = swiftNetworkQUICConnection
 
@@ -414,7 +425,7 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         self.connectionQLogID = ConnectionConstants.nextClientConnectionQLogID()
         let prefix = role == .server ? "L" : "C"
         quicOptions.setLogID(prefix: prefix, parent: "1", protocolLogIDNumber: self.connectionQLogID)
-        quicOptions.setProtocolInstance(swiftNetworkQUICConnection.reference)
+        quicOptions.setProtocolInstance(swiftNetworkQUICConnection.identifier)
 
         swiftNetworkParameters.defaultStack.prepend(applicationProtocol: quicOptions)
         let swiftNetworkPath = SwiftNetwork.PathProperties(parameters: swiftNetworkParameters)
@@ -422,20 +433,18 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
 
         let localEndpoint = localAddress.toEndpoint()
         let remoteEndpoint = remoteAddress.toEndpoint()
-        let streamListenerLinkage = StreamListenerLinkage(reference: self.swiftNetworkQUICConnection.reference)
-        let datagramListenerLinkage = DatagramListenerLinkage(reference: self.swiftNetworkQUICConnection.reference)
-
         let newFlowHandler = QUICChannelNewFlowHandler<Consumer>(
             local: localEndpoint,
             remote: remoteEndpoint,
+            stack: stack,
             parameters: swiftNetworkParameters,
             path: swiftNetworkPath,
             logger: logger,
             remoteAddress: self.remoteAddress,
             localAddress: localAddress,
             role: self.role,
-            streamListenerProtocol: streamListenerLinkage,
-            datagramListenerProtocol: datagramListenerLinkage,
+            connection: swiftNetworkQUICConnection,
+            listener: streamListener,
             // Keep-alive is driven by the connection flow handler on the server, but by the
             // initial client stream on the client (set up below). A client using a stream
             // table has no initial stream, so its flow handler carries it too.
@@ -450,24 +459,27 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         switch mode {
         case .client where !usesStreamTable:
             let streamID = QUICStreamID(rawValue: 0)
-            let streamListenerLinkage = StreamListenerLinkage(reference: self.swiftNetworkQUICConnection.reference)
             let streamHandler = QUICChannelStreamHandler(
                 role: .client,
                 local: localEndpoint,
                 remote: remoteEndpoint,
+                stack: stack,
                 parameters: swiftNetworkParameters,
                 path: swiftNetworkPath,
                 streamID: streamID,
                 logger: logger,
                 remoteAddress: self.remoteAddress,
                 localAddress: localAddress,
-                listenerProtocol: streamListenerLinkage,
+                connection: self.swiftNetworkQUICConnection,
                 connectionChannel: nil,
                 eventLoop: self.eventLoop,
                 keepAliveInterval: configuration.keepAliveInterval
             )
 
             if let streamHandler {
+                streamHandler.keepaliveConfigurator = { [weak streamHandler] seconds, _ in
+                    streamHandler?.configureKeepaliveAfterDelivery(seconds: seconds)
+                }
                 self.pendingInitialClientStream = streamHandler
             } else {
                 fatalError("Could not create a new stream handler")
@@ -480,7 +492,7 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         self.activePath = QUICConnectionPath(
             role: self.role,
             remoteAddress: remoteAddress,
-            context: swiftNetworkParameters.context,
+            stack: stack,
             framePool: self.framePool,
             isValidated: true,
             maxSegments: self.pathMaxSegments,
@@ -495,15 +507,14 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         if usesStreamTable {
             let table = QUICStreamTable<Consumer>(
                 role: self.role,
-                context: swiftNetworkParameters.context
+                stack: stack
             )
 
             // The same references an outbound child-channel stream attaches in
             // 'addNewOutboundStreamInputHandler'.
             table.opener = QUICStreamOpener(
-                listener: streamListenerLinkage,
-                connection: self.swiftNetworkQUICConnection.reference,
-                context: swiftNetworkParameters.context
+                connection: self.swiftNetworkQUICConnection,
+                stack: stack
             )
 
             // Retain cycle is broken in `tearDownConnectionState()`.
@@ -532,13 +543,16 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         self.activePath.attach(PathView(self))
 
         do {
-            try self.swiftNetworkQUICConnection.attachLowerDatagramProtocolForNewPath(
-                self.activePath.reference,
-                remote: remoteEndpoint,
-                local: localEndpoint,
-                parameters: self.swiftNetworkParameters,
-                path: path
-            )
+            try self.stack.withEventContext(self.swiftNetworkQUICConnection.identifier) { eventContext in
+                _ = try self.swiftNetworkQUICConnection.attachLowerProtocolForNewPath(
+                    BaseOutboundDatagramLinkage(external: self.activePath),
+                    remote: remoteEndpoint,
+                    local: localEndpoint,
+                    parameters: self.swiftNetworkParameters,
+                    path: path,
+                    in: &eventContext
+                )
+            }
         } catch {
             fatalError("Could not attach output handler to SwiftNetwork QUIC connection instance")
         }
@@ -645,7 +659,7 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             }
             quicOptions.isUnidirectional = true
         }
-        quicOptions.setProtocolInstance(self.swiftNetworkQUICConnection.reference)
+        quicOptions.setProtocolInstance(self.swiftNetworkQUICConnection.identifier)
 
         quicOptions.setLogID(
             prefix: "C\(self.nextQLogPrefixID())",
@@ -657,20 +671,19 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
 
         let localEndpoint = self.localAddress.toEndpoint()
         let remoteEndpoint = self.activePath.remoteAddress.toEndpoint()
-        let listenerLinkage = StreamListenerLinkage(reference: self.swiftNetworkQUICConnection.reference)
-
         guard
             let streamHandler = QUICChannelStreamHandler(
                 role: self.role,
                 local: localEndpoint,
                 remote: remoteEndpoint,
+                stack: self.stack,
                 parameters: swiftNetworkParameters,
                 path: swiftNetworkPath,
                 streamID: nil,
                 logger: logger,
                 remoteAddress: self.remoteAddress,
                 localAddress: localAddress,
-                listenerProtocol: listenerLinkage,
+                connection: self.swiftNetworkQUICConnection,
                 connectionChannel: connectionChannel,
                 eventLoop: connectionChannel.eventLoop
             )
@@ -794,7 +807,7 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
 
         let handler = QUICChannelStreamHandler(
             role: self.role,
-            parameters: self.swiftNetworkParameters,
+            stack: self.stack,
             streamID: streamID,
             logger: self.logger,
             remoteAddress: self.remoteAddress,
@@ -1300,45 +1313,55 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
         }
 
         // Generate additional CIDs for the peer after handshake completes.
-        if let channelView = self.channelView {
-            // Attach the datagram flow before telling the channel: the channel may write datagrams
-            // as soon as it learns the peer's advertised size.
-            let peerMaxDatagramFrameSize = self.attachDatagramFlow()
-            channelView.handshakeCompleted(peerMaxDatagramFrameSize: peerMaxDatagramFrameSize)
-
-            // Query the value from Swift QUIC. If the peer did explicitly share a limit,
-            // use the RFC minimum.
-            let announcedPeerLimit =
-                self.connectionNewFlowHandler?
-                .getConnectionMetadata()?
-                .connectionMetadata?
-                .activeConnectionIDLimit
-
-            let action = Self.decideCIDAnnouncementCount(
-                peerAnnouncedLimit: announcedPeerLimit,
-                localAnnouncementCap: ConnectionConstants.maximumAnnouncedConnectionIDs
-            )
-            switch action {
-            case .closeTransportParameterError(let reason):
-                let action = self.close(
-                    sendApplicationClose: false,
-                    errorCode: QUICTransportErrorCode.transportParameterError.rawValue,
-                    reason: reason
-                )
-
-                switch action {
-                case .closeInitiated, .alreadyClosed:
-                    // No follow-up decisions to make. We just need to close the connection.
-                    return
-                }
-            case .announce(let count):
-                for _ in 0..<count {
-                    // This will only announce IDs longer than 0 and skip this otherwise.
-                    self.announceNewConnectionID()
-                }
-            }
-        } else {
+        guard let channelView = self.channelView else {
             log("Will not announce new connection IDs because no generator was configured")
+            return
+        }
+        // Attaching the datagram flow needs the stack to be idle, and this runs from inside the
+        // connected delivery; the rest of the handshake-complete work follows the attach so the
+        // channel learns the peer's datagram size before it may write datagrams.
+        self.stack.outsideDelivery {
+            self.handshakeCompleted(channelView: channelView)
+        }
+    }
+
+    /// Finishes connection setup once the handshake has completed and the stack is idle.
+    private func handshakeCompleted(channelView: QUICConnectionChannel<Consumer>.ConnectionView) {
+        // Attach the datagram flow before telling the channel: the channel may write datagrams
+        // as soon as it learns the peer's advertised size.
+        let peerMaxDatagramFrameSize = self.attachDatagramFlow()
+        channelView.handshakeCompleted(peerMaxDatagramFrameSize: peerMaxDatagramFrameSize)
+
+        // Query the value from Swift QUIC. If the peer did explicitly share a limit,
+        // use the RFC minimum.
+        let announcedPeerLimit =
+            self.connectionNewFlowHandler?
+            .getConnectionMetadata()?
+            .connectionMetadata?
+            .activeConnectionIDLimit
+
+        let action = Self.decideCIDAnnouncementCount(
+            peerAnnouncedLimit: announcedPeerLimit,
+            localAnnouncementCap: ConnectionConstants.maximumAnnouncedConnectionIDs
+        )
+        switch action {
+        case .closeTransportParameterError(let reason):
+            let action = self.close(
+                sendApplicationClose: false,
+                errorCode: QUICTransportErrorCode.transportParameterError.rawValue,
+                reason: reason
+            )
+
+            switch action {
+            case .closeInitiated, .alreadyClosed:
+                // No follow-up decisions to make. We just need to close the connection.
+                return
+            }
+        case .announce(let count):
+            for _ in 0..<count {
+                // This will only announce IDs longer than 0 and skip this otherwise.
+                self.announceNewConnectionID()
+            }
         }
     }
 
@@ -1625,7 +1648,7 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
         let path = QUICConnectionPath<Consumer>(
             role: self.role,
             remoteAddress: remoteAddress,
-            context: self.swiftNetworkParameters.context,
+            stack: self.stack,
             framePool: self.framePool,
             isValidated: false,
             maxSegments: self.pathMaxSegments,
@@ -1639,13 +1662,16 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
         self.otherPaths.append(path)
 
         do {
-            try self.swiftNetworkQUICConnection.reference.attachLowerDatagramProtocolForNewPath(
-                path.reference,
-                remote: remoteAddress.toEndpoint(),
-                local: self.localAddress.toEndpoint(),
-                parameters: self.swiftNetworkParameters,
-                path: self.swiftNetworkPath
-            )
+            try self.stack.withEventContext(self.swiftNetworkQUICConnection.identifier) { eventContext in
+                _ = try self.swiftNetworkQUICConnection.attachLowerProtocolForNewPath(
+                    BaseOutboundDatagramLinkage(external: path),
+                    remote: remoteAddress.toEndpoint(),
+                    local: self.localAddress.toEndpoint(),
+                    parameters: self.swiftNetworkParameters,
+                    path: self.swiftNetworkPath,
+                    in: &eventContext
+                )
+            }
         } catch {
             self.logger.error(
                 "Failed to attach a new path",

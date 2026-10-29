@@ -22,87 +22,108 @@ import Testing
 @testable import NIOQUIC
 
 struct QUICConnectionPathTests {
+    /// Runs `body` with a path which is torn down afterwards, as the stack would, so its event
+    /// state is handed back.
     @available(anyAppleOS 26, *)
-    private func makePath(
+    private func withPath(
         isValidated: Bool = false,
-        remoteAddress: SocketAddress = try! SocketAddress(ipAddress: "127.0.0.1", port: 9000)
-    ) -> QUICConnectionPath<QUICStreamChannels> {
+        remoteAddress: SocketAddress = try! SocketAddress(ipAddress: "127.0.0.1", port: 9000),
+        _ body: (QUICConnectionPath<QUICStreamChannels>) throws -> Void
+    ) throws {
         let eventLoop = EmbeddedEventLoop()
         let context = NetworkContext(
             identifier: "test-context",
             externalScheduler: EventLoopBackedScheduler(eventLoop: eventLoop)
         )
-        return QUICConnectionPath(
+        let path = QUICConnectionPath<QUICStreamChannels>(
             role: .server,
             remoteAddress: remoteAddress,
-            context: context,
+            stack: SwiftNetworkStackAccess(context: context),
             framePool: .makePool(forGSO: false),
             isValidated: isValidated,
             maxSegments: 1,
             bufferPoolCapacity: 8,
             logger: Logger(label: "test")
         )
-    }
-
-    @available(anyAppleOS 26, *)
-    @Test
-    func freshPathHasNoQueuedData() {
-        let path = self.makePath()
-        #expect(!path.hasQueuedInboundPackets)
-        #expect(!path.hasQueuedOutboundData)
-    }
-
-    @available(anyAppleOS 26, *)
-    @Test
-    func enqueueInboundPacketTracksQueue() {
-        let path = self.makePath()
-        path.enqueueInboundPacket(ByteBuffer(repeating: 0xAA, count: 100))
-        #expect(path.hasQueuedInboundPackets)
-    }
-
-    @available(anyAppleOS 26, *)
-    @Test
-    func drainInboundFramesEmptiesQueue() {
-        let path = self.makePath()
-        path.enqueueInboundPacket(ByteBuffer(repeating: 0xAA, count: 50))
-        var drained = path.drainInboundFrames(maximumDatagramCount: 10)
-        if drained == nil {
-            Issue.record("Expected non-nil drained frames")
-        } else {
-            drained!.finalizeAllFramesAsFailed()
+        defer {
+            try? path.stack.withEventContext(path.identifier) { eventContext in
+                path.teardown(in: &eventContext)
+            }
         }
-        #expect(!path.hasQueuedInboundPackets)
+        try body(path)
     }
 
     @available(anyAppleOS 26, *)
     @Test
-    func drainInboundFramesReturnsNilWhenEmpty() {
-        let path = self.makePath()
-        let result = path.drainInboundFrames(maximumDatagramCount: 10)
-        if result != nil {
-            Issue.record("Expected nil when draining empty queue")
+    func freshPathHasNoQueuedData() throws {
+        try self.withPath { path in
+            #expect(!path.hasQueuedInboundPackets)
+            #expect(!path.hasQueuedOutboundData)
+        }
+    }
+
+    @available(anyAppleOS 26, *)
+    @Test
+    func enqueueInboundPacketTracksQueue() throws {
+        try self.withPath { path in
+            path.enqueueInboundPacket(ByteBuffer(repeating: 0xAA, count: 100))
+            #expect(path.hasQueuedInboundPackets)
+        }
+    }
+
+    @available(anyAppleOS 26, *)
+    @Test
+    func drainInboundFramesEmptiesQueue() throws {
+        try self.withPath { path in
+            path.enqueueInboundPacket(ByteBuffer(repeating: 0xAA, count: 50))
+            var drained = path.drainInboundFrames(maximumDatagramCount: 10)
+            if drained == nil {
+                Issue.record("Expected non-nil drained frames")
+            } else {
+                drained!.finalizeAllFramesAsFailed()
+            }
+            #expect(!path.hasQueuedInboundPackets)
+        }
+    }
+
+    @available(anyAppleOS 26, *)
+    @Test
+    func drainInboundFramesReturnsNilWhenEmpty() throws {
+        try self.withPath { path in
+            let result = path.drainInboundFrames(maximumDatagramCount: 10)
+            if result != nil {
+                Issue.record("Expected nil when draining empty queue")
+            }
         }
     }
 
     @available(anyAppleOS 26, *)
     @Test
     func idlePathDropsOutboundDatagrams() throws {
-        let path = self.makePath()
-
-        if let datagrams = try path.getDatagramsToSend(.init(), maximumDatagramCount: 2, minimumDatagramSize: 100) {
-            try path.sendDatagrams(.init(), datagrams: datagrams)
+        try self.withPath { path in
+            try path.stack.withEventContext(path.identifier) { eventContext in
+                if let datagrams = try path.getDatagramsToSend(
+                    maximumDatagramCount: 2,
+                    minimumDatagramSize: 100,
+                    for: path.identifier,
+                    in: &eventContext
+                ) {
+                    try path.sendDatagrams(datagrams, from: path.identifier, in: &eventContext)
+                }
+            }
+            #expect(!path.hasQueuedOutboundData)
         }
-        #expect(!path.hasQueuedOutboundData)
     }
 
     @available(anyAppleOS 26, *)
     @Test
-    func detachedPathDropsInboundPackets() {
-        let path = self.makePath()
-        path.detach()
+    func detachedPathDropsInboundPackets() throws {
+        try self.withPath { path in
+            path.detach()
 
-        path.enqueueInboundPacket(ByteBuffer(repeating: 0xAA, count: 50))
-        #expect(!path.hasQueuedInboundPackets)
+            path.enqueueInboundPacket(ByteBuffer(repeating: 0xAA, count: 50))
+            #expect(!path.hasQueuedInboundPackets)
+        }
     }
 
     @available(anyAppleOS 26, *)
@@ -334,11 +355,11 @@ struct QUICConnectionPathTests {
         try #require(connection._forTesting_getOtherPaths().count == 1)
 
         // The active path keeps flushing its last packets.
-        try connection._forTesting_getActivePath().detach(.init())
+        try self.detachFromSwiftNetwork(connection._forTesting_getActivePath())
         try #require(connection._forTesting_getOtherPaths().count == 1)
         #expect(connection._forTesting_getActivePath().remoteAddress == Self.pathAddress)
 
-        try connection._forTesting_getOtherPaths()[0].detach(.init())
+        try self.detachFromSwiftNetwork(connection._forTesting_getOtherPaths()[0])
         #expect(connection._forTesting_getOtherPaths().isEmpty)
     }
 
@@ -349,11 +370,9 @@ struct QUICConnectionPathTests {
         connection.receivePacket(AddressedEnvelope(remoteAddress: Self.newAddress, data: Self.payload))
         let path = try #require(connection._forTesting_getOtherPaths().first)
         // The last packet SwiftNetwork sends on the path, e.g. a CONNECTION_CLOSE.
-        if let datagrams = try path.getDatagramsToSend(.init(), maximumDatagramCount: 1, minimumDatagramSize: 100) {
-            try path.sendDatagrams(.init(), datagrams: datagrams)
-        }
+        try self.sendDatagram(on: path)
 
-        try path.detach(.init())
+        try self.detachFromSwiftNetwork(path)
         #expect(connection._forTesting_getOtherPaths().map(\.remoteAddress) == [Self.newAddress])
 
         let transport = RecordingTransport()
@@ -384,9 +403,7 @@ struct QUICConnectionPathTests {
         connection.receivePacket(AddressedEnvelope(remoteAddress: Self.newAddress, data: Self.payload))
         try #require(connection._forTesting_getOtherPaths().count == 1)
         for path in [connection._forTesting_getOtherPaths()[0], connection._forTesting_getActivePath()] {
-            if let datagrams = try path.getDatagramsToSend(.init(), maximumDatagramCount: 1, minimumDatagramSize: 100) {
-                try path.sendDatagrams(.init(), datagrams: datagrams)
-            }
+            try self.sendDatagram(on: path)
         }
 
         let transport = RecordingTransport()
@@ -406,6 +423,29 @@ struct QUICConnectionPathTests {
         }
         // Twice the 8 connection IDs a connection hands out at most.
         #expect(connection._forTesting_getRetiredSCIDs() == Array(retiredIDs.suffix(16)))
+    }
+
+    /// Detaches `path` the way SwiftNetwork does once it stops using the path.
+    @available(anyAppleOS 26, *)
+    private func detachFromSwiftNetwork(_ path: QUICConnectionPath<QUICStreamChannels>) throws {
+        try path.stack.withEventContext(path.identifier) { eventContext in
+            try path.detach(for: path.identifier, in: &eventContext)
+        }
+    }
+
+    /// Hands `path` a datagram to send, the way SwiftNetwork does.
+    @available(anyAppleOS 26, *)
+    private func sendDatagram(on path: QUICConnectionPath<QUICStreamChannels>) throws {
+        try path.stack.withEventContext(path.identifier) { eventContext in
+            if let datagrams = try path.getDatagramsToSend(
+                maximumDatagramCount: 1,
+                minimumDatagramSize: 100,
+                for: path.identifier,
+                in: &eventContext
+            ) {
+                try path.sendDatagrams(datagrams, from: path.identifier, in: &eventContext)
+            }
+        }
     }
 
     /// Every path `connection` tracks, the active one first.

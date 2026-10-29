@@ -43,7 +43,7 @@ private enum LogLevel {
 /// `QUICChannelStreamHandler` is the bridge between SwiftNetwork and our code on the application-side;
 /// one `QUICChannelStreamHandler` exists for each QUIC stream.
 @available(anyAppleOS 26, *)
-final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHandler, @unchecked Sendable {
+final class QUICChannelStreamHandler: ExternalInboundStreamLinkage, ProtocolInstance, @unchecked Sendable {
 
     // MARK: Channel and ChannelCore conformanace
 
@@ -79,19 +79,20 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
 
     // MARK: Private Constant state
 
-    internal typealias LowerProtocol = OutboundStreamLinkage
+    internal typealias LowerProtocol = BaseOutboundStreamLinkage
 
     private let role: Role
     private let logger: Logger
-    internal var reference: ProtocolInstanceReference = ProtocolInstanceReference()
+    internal var identifier = InstanceIdentifier()
 
     internal var eventManager = ProtocolEventManager()
     internal var streamStateMachine: QUICStreamStateMachine
     private var pipelineStateMachine: QUICStreamPipelineStateMachine
     internal var swiftNetworkStreamHandle: SwiftNetworkStreamHandle
 
-    // Stream state machine (RFC 9000 Section 3 compliant)
-    internal var context: SwiftNetwork.NetworkContext
+    /// The connection's entry into its SwiftNetwork stack.
+    internal let stack: SwiftNetworkStackAccess
+    internal var context: NetworkContext { self.stack.context }
     internal var streamID: QUICStreamID?
 
     // MARK: Private mutable state
@@ -125,11 +126,24 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
 
     private var originalMetadata: ProtocolMetadata<QUICProtocol>?
     private var connectedEventHandler: ((QUICStreamID?) -> Void)?
+    /// Arms the connection keep-alive while a delivery already holds the event context.
+    var keepaliveConfigurator: ((UInt16, inout NetworkContext.EventContext) -> Void)?
     private var disconnectedEventHandler: ((NetworkError?) -> Void)?
+
+    /// Applies the keep-alive interval through `QUICConnectionMetadata.setKeepalive(keepAlive:)`.
+    ///
+    /// That setter enters the stack on its own, so it must not run while the connected delivery
+    /// still holds the event context. It runs on the next event-loop tick instead, once the
+    /// delivery has returned.
+    internal func configureKeepaliveAfterDelivery(seconds: UInt16) {
+        self.eventLoop.execute { [weak self] in
+            self?.getStreamMetadata()?.connectionMetadata?.setKeepalive(keepAlive: seconds)
+        }
+    }
 
     internal init(
         role: Role,
-        parameters: Parameters,
+        stack: SwiftNetworkStackAccess,
         streamID: QUICStreamID?,
         logger: Logger,
         remoteAddress: SendableAddress,
@@ -142,7 +156,7 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
         self.logger = logger
         self._remoteAddress = remoteAddress
         self._localAddress = localAddress
-        self.context = parameters.context
+        self.stack = stack
         if let keepAlive = keepAliveInterval {
             self._keepAliveInterval = UInt16(clamping: keepAlive.components.seconds)
         }
@@ -161,20 +175,21 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
         self._pipeline = ChannelPipeline(channel: self)
 
         // This creates a retain cycle, it's broken in close '_close(error:promise:)'
-        self.reference = ProtocolInstanceReference(custom: self)
+        self.identifier = stack.register(&self.eventManager)
     }
 
     internal init?(
         role: Role,
         local: Endpoint,
         remote: Endpoint,
+        stack: SwiftNetworkStackAccess,
         parameters: Parameters,
         path: PathProperties,
         streamID: QUICStreamID?,
         logger: Logger,
         remoteAddress: SendableAddress,
         localAddress: SocketAddress?,
-        listenerProtocol: StreamListenerLinkage,
+        connection: SwiftNetwork.QUICConnection,
         connectionChannel: (any Channel)?,
         eventLoop: any EventLoop,
         keepAliveInterval: Duration? = nil,
@@ -184,7 +199,7 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
         self.logger = logger
         self._remoteAddress = remoteAddress
         self._localAddress = localAddress
-        self.context = parameters.context
+        self.stack = stack
         if let keepAlive = keepAliveInterval {
             self._keepAliveInterval = UInt16(clamping: keepAlive.components.seconds)
         }
@@ -202,12 +217,22 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
         self._closePromise = eventLoop.makePromise(of: Void.self)
 
         // This creates a retain cycle, it's broken in close '_close(error:promise:)'
-        self.reference = ProtocolInstanceReference(custom: self)
+        self.identifier = stack.register(&self.eventManager)
 
-        let linkage: OutboundStreamLinkage
+        var connection = connection
+        let linkage: BaseOutboundStreamLinkage
         do throws(NetworkError) {
-            linkage = try listenerProtocol.invokeAttachUpperStreamProtocolToNewFlow(
-                reference,
+            let upper = BaseInboundStreamLinkage(external: self)
+            linkage = try connection.attachUpperProtocolToNewFlow(
+                upper,
+                remote: remote,
+                local: local,
+                parameters: parameters,
+                path: path
+            )
+            // The second leg runs the stream's setup, which assigns its ID.
+            try linkage.invokeAttachUpperProtocol(
+                upper,
                 remote: remote,
                 local: local,
                 parameters: parameters,
@@ -299,9 +324,16 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
 
     // Event that signals that RESET_STREAM was received
     internal func handleInboundAbortedEvent(
-        _ from: SwiftNetwork.ProtocolInstanceReference,
-        error: SwiftNetwork.NetworkError?
+        error: SwiftNetwork.NetworkError?,
+        for instance: InstanceIdentifier,
+        in eventContext: inout NetworkContext.EventContext
     ) {
+        self.stack.lending(&eventContext) {
+            self.handleInboundAborted(error: error)
+        }
+    }
+
+    private func handleInboundAborted(error: SwiftNetwork.NetworkError?) {
         if let error, let applicationErrorCode = error.quicApplicationError, applicationErrorCode >= 0 {
             self.log("Received reset stream error", metadata: ["applicationErrorCode": "\(applicationErrorCode)"])
             // applicationErrorCode comes from the wire as a QUIC variable-length
@@ -389,9 +421,16 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
 
     // Event that signals that STOP_SENDING was received
     internal func handleOutboundAbortedEvent(
-        _ from: SwiftNetwork.ProtocolInstanceReference,
-        error: SwiftNetwork.NetworkError?
+        error: SwiftNetwork.NetworkError?,
+        for instance: InstanceIdentifier,
+        in eventContext: inout NetworkContext.EventContext
     ) {
+        self.stack.lending(&eventContext) {
+            self.handleOutboundAborted(error: error)
+        }
+    }
+
+    private func handleOutboundAborted(error: SwiftNetwork.NetworkError?) {
         if let error, let applicationErrorCode = error.quicApplicationError, applicationErrorCode >= 0 {
             self.log("Received stop sending error: \(applicationErrorCode)")
             // applicationErrorCode comes from the wire as a QUIC variable-length
@@ -450,13 +489,12 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
 
     // Send a STOP_SENDING frame to close the read (Note, this stream will receive a RESET_STREAM in return)
     internal func abortInbound(error: NetworkError?) {
-        let reference = self.reference
-        reference.fromExternal {
+        try? self.stack.withEventContext(self.identifier) { eventContext in
             do throws(NetworkError) {
                 self.log("abortInbound")
                 switch self.swiftNetworkStreamHandle.invokeAbortInbound() {
                 case .proceed(let linkage):
-                    try linkage.invokeAbortInbound(reference, error: error)
+                    try linkage.invokeAbortInbound(error: error, for: self.identifier, in: &eventContext)
                 case .ignore:
                     break
                 }
@@ -469,12 +507,11 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
 
     // Send a RESET_STREAM frame to close the write
     internal func abortOutbound(error: NetworkError?) {
-        let reference = self.reference
-        reference.fromExternal {
+        try? self.stack.withEventContext(self.identifier) { eventContext in
             do throws(NetworkError) {
                 switch self.swiftNetworkStreamHandle.invokeAbortOutbound() {
                 case .proceed(let linkage):
-                    try linkage.invokeAbortOutbound(reference, error: error)
+                    try linkage.invokeAbortOutbound(error: error, for: self.identifier, in: &eventContext)
                 case .ignore:
                     break
                 }
@@ -627,7 +664,9 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
         self.eventLoop.preconditionInEventLoop()
         switch self.swiftNetworkStreamHandle.invokeConnect() {
         case .proceed(let linkage):
-            linkage.invokeConnect(self.reference)
+            try? self.stack.withEventContext(self.identifier) { eventContext in
+                linkage.invokeConnect(for: self.identifier, in: &eventContext)
+            }
         case .handleViolation(let reason):
             preconditionFailure("invokeConnect on SwiftNetworkStreamHandle: \(reason)")
         }
@@ -657,18 +696,23 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
 
         switch self.swiftNetworkStreamHandle.invokeDisconnect() {
         case .proceed(let linkage):
-            linkage.invokeDisconnect(self.reference, error: nil)
+            try? self.stack.withEventContext(self.identifier) { eventContext in
+                linkage.invokeDisconnect(error: nil, for: self.identifier, in: &eventContext)
+            }
         case .ignore:
             break
         }
         if detachFromLowerProtocol {
             switch self.swiftNetworkStreamHandle.invokeDetach() {
             case .proceed(let linkage):
-                do throws(NetworkError) {
-                    try linkage.invokeDetach(self.reference)
+                do {
+                    try self.stack.withEventContext(self.identifier) { eventContext in
+                        try linkage.invokeDetach(for: self.identifier, in: &eventContext)
+                    }
                 } catch {
                     self.log("Failed to detach lower protocol: \(error)")
                 }
+                self.releaseStackStateIfDetached()
             case .skipAlreadyDetached:
                 break
             }
@@ -683,21 +727,31 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
     /// Called when the stream handler receives a disconnected event.
     ///
     /// Runs the close cascade synchronously
-    internal func handleDisconnectedEvent(_ from: ProtocolInstanceReference, error: NetworkError?) {
+    internal func handleDisconnectedEvent(
+        error: NetworkError?,
+        for instance: InstanceIdentifier,
+        in eventContext: inout NetworkContext.EventContext
+    ) {
         self.log("handleDisconnectedEvent error: \(String(describing: error))")
-        switch self.swiftNetworkStreamHandle.invokeDetach() {
-        case .proceed(let linkage):
-            do throws(NetworkError) {
-                try linkage.invokeDetach(self.reference)
-            } catch {
-                self.log("Failed to detach lower protocol: \(error)")
+        self.stack.lending(&eventContext) {
+            switch self.swiftNetworkStreamHandle.invokeDetach() {
+            case .proceed(let linkage):
+                do {
+                    try self.stack.withEventContext(self.identifier) { eventContext in
+                        try linkage.invokeDetach(for: self.identifier, in: &eventContext)
+                    }
+                } catch {
+                    self.log("Failed to detach lower protocol: \(error)")
+                }
+            case .skipAlreadyDetached:
+                break
             }
-        case .skipAlreadyDetached:
-            break
-        }
 
-        let quicError = error.flatMap { QUICConnectionError(networkError: $0) }
-        self._close(error: quicError ?? error, promise: nil)
+            let quicError = error.flatMap { QUICConnectionError(networkError: $0) }
+            self._close(error: quicError ?? error, promise: nil)
+            // `_close` is a no-op for a channel which closed before its stream detached.
+            self.releaseStackStateIfDetached()
+        }
     }
 
     @inline(__always)
@@ -738,11 +792,16 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
     // Called when data is available to be read on the stream
     // NOTE: New flows with a single read with not get this event and should optimistically read when the flow is started.
     // This event will be called for all future input available after the flow starts.
-    internal func handleInboundDataAvailableEvent(_ from: ProtocolInstanceReference) {
+    internal func handleInboundDataAvailableEvent(
+        for instance: InstanceIdentifier,
+        in eventContext: inout NetworkContext.EventContext
+    ) {
         switch self.streamStateMachine.inboundDataAvailable() {
         case .readData:
             self.log("received input room available")
-            self.deliverInboundDataDownstreamIfDemand()
+            self.stack.lending(&eventContext) {
+                self.deliverInboundDataDownstreamIfDemand()
+            }
 
         case .doNotRead:
             break
@@ -815,12 +874,27 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
         }
     }
 
-    internal func handleOutboundRoomAvailableEvent(_ from: ProtocolInstanceReference) {
+    internal func handleOutboundRoomAvailableEvent(
+        for instance: InstanceIdentifier,
+        in eventContext: inout NetworkContext.EventContext
+    ) {
         log("received output available")
     }
 
     // Stream handler is in the connected state
-    internal func handleConnectedEvent(_ from: ProtocolInstanceReference) {
+    internal func handleConnectedEvent(
+        for instance: InstanceIdentifier,
+        in eventContext: inout NetworkContext.EventContext
+    ) {
+        if let keepAliveTime = self._keepAliveInterval, let configure = self.keepaliveConfigurator {
+            configure(keepAliveTime, &eventContext)
+        }
+        self.stack.lending(&eventContext) {
+            self.handleConnected()
+        }
+    }
+
+    private func handleConnected() {
         self.eventLoop.preconditionInEventLoop()
         log("connected")
 
@@ -834,7 +908,7 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
         self.pipeline.fireChannelRegistered()
         self.pipeline.fireChannelActive()
         log("setting up metadata handlers")
-        if let keepAliveTime = self._keepAliveInterval {
+        if self.keepaliveConfigurator == nil, let keepAliveTime = self._keepAliveInterval {
             log("setting keepalive interval")
             metadata.connectionMetadata?.setKeepalive(keepAlive: keepAliveTime)
         }
@@ -887,11 +961,10 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
 
     // Get metadata about the stream from the internal QUIC stack
     private final func getMetadata<P: NetworkProtocol>() -> ProtocolMetadata<P>? {
-        let reference = self.reference
-        return reference.fromExternal {
+        try? self.stack.withEventContext(self.identifier) { eventContext in
             switch self.swiftNetworkStreamHandle.invokeGetMetadata() {
             case .proceed(let linkage):
-                return linkage.invokeGetMetadata(reference) as ProtocolMetadata<P>?
+                return linkage.invokeGetMetadata(for: self.identifier, in: &eventContext) as ProtocolMetadata<P>?
             case .ignore:
                 return nil
             }
@@ -951,7 +1024,11 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
 
             switch self.swiftNetworkStreamHandle.invokeSendStreamData() {
             case .proceed(let linkage):
-                try linkage.invokeSendStreamData(self.reference, streamData: frameArray)
+                try self.stack.withEventContext(self.identifier, frameArray) {
+                    eventContext,
+                    frameArray in
+                    try linkage.invokeSendStreamData(frameArray, from: self.identifier, in: &eventContext)
+                }
             case .handleViolation(let reason):
                 frameArray.finalizeAllFramesAsFailed()
                 throw SwiftNetworkStreamHandle.violationError(operation: "invokeSendStreamData", reason: reason)
@@ -974,7 +1051,11 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
             var finFrameArray = FrameArray(frame: finFrame)
             switch self.swiftNetworkStreamHandle.invokeSendStreamData() {
             case .proceed(let linkage):
-                try linkage.invokeSendStreamData(self.reference, streamData: finFrameArray)
+                try self.stack.withEventContext(self.identifier, finFrameArray) {
+                    eventContext,
+                    finFrameArray in
+                    try linkage.invokeSendStreamData(finFrameArray, from: self.identifier, in: &eventContext)
+                }
             case .handleViolation(let reason):
                 finFrameArray.finalizeAllFramesAsFailed()
                 throw SwiftNetworkStreamHandle.violationError(operation: "invokeSendStreamData", reason: reason)
@@ -1001,14 +1082,17 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
         }
 
         var frameArray: FrameArray?
-        do throws(NetworkError) {
+        do {
             switch self.swiftNetworkStreamHandle.invokeReceiveStreamData() {
             case .proceed(let linkage):
-                frameArray = try linkage.invokeReceiveStreamData(
-                    self.reference,
-                    minimumBytes: 1,
-                    maximumBytes: Int.max
-                )
+                frameArray = try self.stack.withEventContext(self.identifier) { eventContext in
+                    try linkage.invokeReceiveStreamData(
+                        minimumBytes: 1,
+                        maximumBytes: Int.max,
+                        for: self.identifier,
+                        in: &eventContext
+                    )
+                }
             case .handleViolation(let reason):
                 throw SwiftNetworkStreamHandle.violationError(operation: "invokeReceiveStreamData", reason: reason)
             }
@@ -1156,44 +1240,22 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
 }
 
 @available(anyAppleOS 26, *)
-extension QUICChannelStreamHandler: UpperProtocolHandler {
-    internal func handleNetworkProtocolEvent(
-        _ from: SwiftNetwork.ProtocolInstanceReference,
-        event: SwiftNetwork.NetworkProtocolEvent
-    ) {
-        // do nothing
-    }
-
-    // UpperProtocolHandler conformance
-    internal func attachLowerStreamProtocol(
-        _ lowerProtocol: SwiftNetwork.ProtocolInstanceReference,
-        remote: SwiftNetwork.Endpoint?,
-        local: SwiftNetwork.Endpoint?,
-        parameters: SwiftNetwork.Parameters?,
-        path: SwiftNetwork.PathProperties?
-    ) throws(SwiftNetwork.NetworkError) {
-        throw NetworkError.posix(ENOTSUP)
-    }
-
-    // UpperProtocolHandler conformance
-    internal func attachLowerProtocol(
-        _ lowerProtocol: SwiftNetwork.ProtocolInstanceReference,
-        remote: SwiftNetwork.Endpoint?,
-        local: SwiftNetwork.Endpoint?,
-        parameters: SwiftNetwork.Parameters?,
-        path: SwiftNetwork.PathProperties?
-    ) throws(SwiftNetwork.NetworkError) {
-        throw NetworkError.posix(ENOTSUP)
-    }
-}
-
-@available(anyAppleOS 26, *)
 extension QUICChannelStreamHandler {
-    func attachLowerStreamProtocolToExistingFlow(
-        listener: StreamListenerLinkage,
-        flowReference: ProtocolInstanceReference
+    func invokeAttachLowerProtocol(
+        _ lowerProtocol: BaseOutboundStreamLinkage,
+        remote: Endpoint?,
+        local: Endpoint?,
+        parameters: Parameters?,
+        path: PathProperties?
     ) throws(NetworkError) {
         throw NetworkError.posix(ENOTSUP)
+    }
+
+    func handleNetworkProtocolEvent(
+        event: NetworkProtocolEvent,
+        for instance: InstanceIdentifier,
+        in eventContext: inout NetworkContext.EventContext
+    ) {
     }
 }
 
@@ -1398,10 +1460,21 @@ extension QUICChannelStreamHandler: Channel, ChannelCore {
             if let disconnect = self.disconnectedEventHandler {
                 disconnect(nil)
             }
-            // Break the retain cycle between the ref and self.
-            self.reference = ProtocolInstanceReference()
+            self.releaseStackStateIfDetached()
+            self.keepaliveConfigurator = nil
             self.clearHandlers()
         }
+    }
+
+    /// Hands the event state back to the stack once the channel is closed and the stream has
+    /// detached from the stack.
+    ///
+    /// Both have to hold: a closed channel whose stream is still attached (its FIN is not yet
+    /// acknowledged, say) is still the target of the stack's events, and a detached stream whose
+    /// channel is still open is still handing calls to the stack. Idempotent.
+    private func releaseStackStateIfDetached() {
+        guard self.isClosed, !self.swiftNetworkStreamHandle.isAttached else { return }
+        self.stack.release(self)
     }
 
     /// Close the send side gracefully: flush any buffered write data with a FIN,

@@ -19,12 +19,6 @@ public struct QUICStreamHandle: Hashable, Sendable {
     @usableFromInline
     var _generation: Generation
 
-    @inlinable
-    var rawValue: UInt {
-        let indexBits = UInt(self._index._rawValue)
-        return indexBits | UInt(self._generation.rawValue) << UIntHalf.bitWidth
-    }
-
     /// The index of the slot the stream occupies in the connection's stream table.
     @inlinable
     var index: Index {
@@ -42,14 +36,6 @@ public struct QUICStreamHandle: Hashable, Sendable {
     init(index: Index, generation: Generation) {
         self._index = index
         self._generation = generation
-    }
-
-    /// Rebuilds a handle which was flattened to its raw bits.
-    @inlinable
-    init(rawValue: UInt) {
-        self._index = Index(UIntHalf(truncatingIfNeeded: rawValue))
-        let generationBits = rawValue >> UIntHalf.bitWidth
-        self._generation = Generation(UIntHalf(truncatingIfNeeded: generationBits))
     }
 }
 
@@ -118,16 +104,7 @@ extension QUICStreamHandle {
     }
 }
 
-// MARK: - NetworkFramework indexing
-
-// When creating a `ProtocolInstanceReference` for a given stream you can specify the container and
-// an index. That is, a `ProtocolInstanceContainer` can service many `ProtocolInstance`s as each is
-// keyed by an `Int` index. Since the index is only an `Int` we need to pack the whole handle into
-// it: its slot index and generation.
-//
-// Note that this will change in SwiftNetwork so this is unlikely to be the end state and will need
-// to be revisited then. (That's no bad thing because the slot indexing and generation are a lot
-// smaller on 32-bit platforms to squeeze them into an `Int`.)
+// The slot index and generation are each half a word so that a handle stays a single word.
 
 #if _pointerBitWidth(_64)
 @usableFromInline
@@ -140,18 +117,3 @@ typealias UIntHalf = UInt16
 #else
 #error("Unsupported pointer size")
 #endif
-
-@available(anyAppleOS 26, *)
-extension QUICStreamHandle {
-    /// The index stored by SwiftNetwork for a given handle.
-    @inlinable
-    var protocolInstanceReferenceIndex: Int {
-        Int(bitPattern: self.rawValue)
-    }
-
-    /// Rebuilds the handle the stack was given as a container index.
-    @inlinable
-    init(protocolInstanceReferenceIndex: Int) {
-        self.init(rawValue: UInt(bitPattern: protocolInstanceReferenceIndex))
-    }
-}

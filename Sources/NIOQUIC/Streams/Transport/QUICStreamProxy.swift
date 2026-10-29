@@ -25,126 +25,97 @@ import Android
 import Musl
 #endif
 
+/// External stream linkage for one table slot.
+///
+/// Every delivery lends its event context to the table, which may call back into the stack while
+/// handling it.
 @available(anyAppleOS 26, *)
-struct QUICStreamProxy<Consumer: QUICStreamConsumer & ~Copyable> {
-    typealias LowerProtocol = OutboundStreamLinkage
-
+final class QUICStreamProxy<Consumer: QUICStreamConsumer & ~Copyable>: ExternalInboundStreamLinkage, ProtocolInstance {
     let table: QUICStreamTable<Consumer>
     let handle: QUICStreamHandle
-}
+    var context: NetworkContext { self.table.stack.context }
+    var identifier: InstanceIdentifier
+    var eventManager = ProtocolEventManager()
 
-// MARK: - ProtocolInstance
-
-@available(anyAppleOS 26, *)
-extension QUICStreamProxy: ProtocolInstance where Consumer: ~Copyable {
-    var context: SwiftNetwork.NetworkContext {
-        self.table.context
+    init(table: QUICStreamTable<Consumer>, handle: QUICStreamHandle) {
+        self.table = table
+        self.handle = handle
+        self.identifier = InstanceIdentifier()
+        self.identifier = table.stack.register(&self.eventManager)
     }
 
-    var reference: ProtocolInstanceReference {
-        self.table.reference(for: self.handle)
+    func invokeAttachLowerProtocol(
+        _ lowerProtocol: BaseOutboundStreamLinkage,
+        remote: Endpoint?,
+        local: Endpoint?,
+        parameters: Parameters?,
+        path: PathProperties?
+    ) throws(NetworkError) {
+        throw NetworkError.posix(ENOTSUP)
     }
 
-    /// The slot's event manager.
-    var eventManager: ProtocolEventManager {
-        // The event manager in each `else` branch _should_ be unreachable: a reference is only
-        // ever built for a live handle, and all stack callbacks go via the table which drops
-        // handles that no longer resolve.
-        _read {
-            if let transport = self.table.transportState(for: self.handle) {
-                yield transport.pointee.eventManager
-            } else {
-                assertionFailure("No eventManager for proxy")
-                let eventManager = ProtocolEventManager()
-                yield eventManager
-            }
-        }
-        nonmutating _modify {
-            if let transport = self.table.transportState(for: self.handle) {
-                yield &transport.pointee.eventManager
-            } else {
-                assertionFailure("No eventManager for proxy")
-                var eventManager = ProtocolEventManager()
-                yield &eventManager
-            }
+    func handleConnectedEvent(for instance: InstanceIdentifier, in eventContext: inout NetworkContext.EventContext) {
+        self.table.stack.lending(&eventContext) {
+            self.table.streamConnected(self.handle)
         }
     }
-}
 
-// MARK: - InboundStreamHandler
-
-@available(anyAppleOS 26, *)
-extension QUICStreamProxy: InboundStreamHandler where Consumer: ~Copyable {
-    /// The stack assigned the stream its ID.
-    func handleConnectedEvent(_ from: ProtocolInstanceReference) {
-        self.table.streamConnected(self.handle)
+    func handleDisconnectedEvent(
+        error: NetworkError?,
+        for instance: InstanceIdentifier,
+        in eventContext: inout NetworkContext.EventContext
+    ) {
+        self.table.stack.lending(&eventContext) {
+            self.table.streamDisconnected(self.handle, error: error)
+        }
     }
 
-    /// The stream is finished with, cleanly or not.
-    func handleDisconnectedEvent(_ from: ProtocolInstanceReference, error: NetworkError?) {
-        self.table.streamDisconnected(self.handle, error: error)
+    func handleInboundDataAvailableEvent(
+        for instance: InstanceIdentifier,
+        in eventContext: inout NetworkContext.EventContext
+    ) {
+        self.table.stack.lending(&eventContext) {
+            self.table.markReady(handle: self.handle, events: .readable)
+        }
     }
 
-    /// The peer's data can be read.
-    func handleInboundDataAvailableEvent(_ from: ProtocolInstanceReference) {
-        self.table.markReady(handle: self.handle, events: .readable)
+    func handleOutboundRoomAvailableEvent(
+        for instance: InstanceIdentifier,
+        in eventContext: inout NetworkContext.EventContext
+    ) {
+        self.table.stack.lending(&eventContext) {
+            self.table.markReady(handle: self.handle, events: .writable)
+        }
     }
 
-    /// The stack has room for more outbound data.
-    func handleOutboundRoomAvailableEvent(_ from: ProtocolInstanceReference) {
-        self.table.markReady(handle: self.handle, events: .writable)
-    }
-
-    /// The peer sent RESET\_STREAM.
-    func handleInboundAbortedEvent(_ from: ProtocolInstanceReference, error: NetworkError?) {
-        switch Self.applicationErrorCode(error) {
-        case .some(let code):
+    func handleInboundAbortedEvent(
+        error: NetworkError?,
+        for instance: InstanceIdentifier,
+        in eventContext: inout NetworkContext.EventContext
+    ) {
+        guard let code = Self.applicationErrorCode(error) else { return }
+        self.table.stack.lending(&eventContext) {
             self.table.peerResetStream(self.handle, code: code)
-        case .none:
-            ()  // No application error code: nothing to surface as a reset.
         }
     }
 
-    /// The peer sent STOP\_SENDING.
-    func handleOutboundAbortedEvent(_ from: ProtocolInstanceReference, error: NetworkError?) {
-        switch Self.applicationErrorCode(error) {
-        case .some(let code):
+    func handleOutboundAbortedEvent(
+        error: NetworkError?,
+        for instance: InstanceIdentifier,
+        in eventContext: inout NetworkContext.EventContext
+    ) {
+        guard let code = Self.applicationErrorCode(error) else { return }
+        self.table.stack.lending(&eventContext) {
             self.table.peerStoppedSending(self.handle, code: code)
-        case .none:
-            ()  // No application error code: nothing to surface as a stop-sending.
         }
     }
 
-    func handleNetworkProtocolEvent(_ from: ProtocolInstanceReference, event: NetworkProtocolEvent) {
-        // Connection-scoped events are delivered on the connection's own instance, not on a stream's.
+    func handleNetworkProtocolEvent(
+        event: NetworkProtocolEvent,
+        for instance: InstanceIdentifier,
+        in eventContext: inout NetworkContext.EventContext
+    ) {
         ()
-    }
-
-    func attachLowerProtocol(
-        _ lowerProtocol: ProtocolInstanceReference,
-        remote: Endpoint?,
-        local: Endpoint?,
-        parameters: Parameters?,
-        path: PathProperties?
-    ) throws(NetworkError) {
-        throw NetworkError.posix(ENOTSUP)
-    }
-
-    func attachLowerStreamProtocol(
-        _ lowerProtocol: ProtocolInstanceReference,
-        remote: Endpoint?,
-        local: Endpoint?,
-        parameters: Parameters?,
-        path: PathProperties?
-    ) throws(NetworkError) {
-        throw NetworkError.posix(ENOTSUP)
-    }
-
-    func attachLowerStreamProtocolToExistingFlow(
-        listener: StreamListenerLinkage,
-        flowReference: ProtocolInstanceReference
-    ) throws(NetworkError) {
-        throw NetworkError.posix(ENOTSUP)
     }
 
     private static func applicationErrorCode(_ error: NetworkError?) -> QUICApplicationErrorCode? {

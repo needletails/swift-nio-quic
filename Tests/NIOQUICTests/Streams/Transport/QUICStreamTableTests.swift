@@ -13,6 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 import NIOCore
+import NIOEmbedded
 import NIOQUICHelpers
 @_spi(Essentials) @_spi(ProtocolProvider) import SwiftNetwork
 import Testing
@@ -534,8 +535,10 @@ struct QUICStreamTableTests {
         var consumer = RecordingConsumer()
         let handle = table.insertSlot(id: 0, state: nil)
 
-        let proxy = QUICStreamProxy(table: table, handle: handle)
-        proxy.handleOutboundRoomAvailableEvent(table.reference(for: handle))
+        let proxy = table.external(for: handle)
+        try? table.stack.withEventContext(proxy.identifier) { eventContext in
+            proxy.handleOutboundRoomAvailableEvent(for: proxy.identifier, in: &eventContext)
+        }
 
         table.drain(into: &consumer)
         #expect(consumer.sightings.count == 1)
@@ -545,7 +548,12 @@ struct QUICStreamTableTests {
 
 @available(anyAppleOS 26, *)
 extension QUICStreamTable {
+    /// A table whose stack runs on the calling thread, which an `EmbeddedEventLoop` counts as its own.
     convenience init(role: Role) {
-        self.init(role: role, context: Parameters().context)
+        let context = NetworkContext(
+            identifier: "test-context",
+            externalScheduler: EventLoopBackedScheduler(eventLoop: EmbeddedEventLoop())
+        )
+        self.init(role: role, stack: SwiftNetworkStackAccess(context: context))
     }
 }
